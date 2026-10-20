@@ -1,7 +1,9 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 1 research complete, phase 2 partial (binaries-only workspace), phase 3
-orientation started** — 2026-10-20. Claim issue: cranebeaker/coop-anything#83.
+Status: **phase 1 research complete, phase 2 (binaries-only workspace), phase 3
+complete (Ghidra headless reachability), phase 4 decision memo written** —
+2026-10-20. Claim issue: cranebeaker/coop-anything#83.
+Phase-4 recommendation: **route (c)** — see [DECISION.md](DECISION.md).
 No code, no mod, no test run yet.
 
 ## Game identity (observed, verified this session)
@@ -51,8 +53,9 @@ No code, no mod, no test run yet.
   RTTI checks, how to find them again after updates). It documents its build as
   `667B1777-949F000` (PE timestamp + SizeOfImage) — **identical to our exe's identity**
   (`0x667B1777` / `0x949F000`), so its RVAs almost certainly apply to our binary; it also
-  states Steam build `14835813` vs our recorded `13801562` (see Unknown — verify one RVA
-  before trusting).
+  states Steam build `14835813` vs our recorded `13801562` — **verified this session**:
+  18/19 documented RVAs byte-exact on our exe, so the exe content matches and the build-id
+  difference is a depot recording difference (see "Strikers RVA verification" below).
 - Status: **Path 1 candidate is dead for campaign co-op** (Strikers is board-game only),
   but it is the reference for injection + memory + two-instance networking on this game.
 
@@ -134,6 +137,86 @@ Scan: `local/pe_scan.py` (Python + `pefile` 2024.8.26, already on PATH) against
   wrapping Steam callbacks), `x-session-id`, `SessionID`/`session_id` telemetry fields.
 - Co-op-relevant source files survive as debug strings (`.../Code/ThirdParty/...` paths).
 
+## Phase 3 (complete): Ghidra headless reachability (observed, 2026-10-20)
+
+Tools installed this session (all inside git-ignored `local/`, owner pre-approved):
+Ghidra 12.1.4 official release zip (SHA-256 verified against the release notes:
+`ddac49f9…87d2d4db`) in `local/ghidra/`, Temurin JDK 21 in `local/jdk21/`
+(Ghidra 12 needs JDK 21; system Java is 17). Headless project `local/ghidra_proj`
+(`analyzeHeadless.bat`, ~20 min full analysis of the 46 MB exe). Post-analysis
+scripts: `local/ghidra_scripts/NetReachability{,2,3}.java`; reports
+`local/ghidra_net_reachability*.txt`; logs `local/ghidra_headless*.log`.
+
+Full findings + decompile excerpts: [DECISION.md](DECISION.md). Summary:
+
+- **Startup chain**: the exe exports `MainProg` and `GameMainProg`; call graph
+  `MainProg` → `GameMainProg` → `FUN_140d2fca0` → `FUN_140d3d960` (~920-line
+  net-subsystem ctor, inside `MainProg`'s forward closure of 2,584 functions).
+- **NoOp is wired, unconditionally**: the subsystem ctor writes
+  `NetSessionManagerNoOp::vftable` (RVA `0x184AEE0`) into the session-manager
+  slot; NoOp object is a 0x50-byte stub (name-getter slot returns
+  `"NetSessionManagerNoOp"`). Sibling NoOp stubs wired the same way:
+  `NetNpAvailabilityCheckNoOp`, `NetFriendManagerNoOp`,
+  `NetSignInDialogServiceNoOp`, `CommerceManagerNoOp`,
+  `UnifiedEntitlementManagerNoOp`.
+- **Real `NetSessionManager` is link-stripped**: only its MSVC TypeDescriptor
+  survives (RVA `0x224E948`, referenced exactly once in the whole file — as
+  NoOp's base-class descriptor at RVA `0x19F4658`). No Complete-Object Locator,
+  no vtable, no name string, no constructor anywhere in the image (raw byte scan
+  all sections). Nothing to flip on.
+- **Party/matchmaking layer is real and constructed at every startup** from the
+  same ctor: `NetPartyManager` ctor `FUN_140426d30`, `NetPartyManagerPC` vtables
+  written inline, `MatchmakingService` ctor `FUN_140b116b0`,
+  `StateMatchmaking` ctor `FUN_1413a75c0` — destructors also have real callers.
+- **Transport**: `"SteamNetworkingSockets012"` (RVA `0x178D3B4`) has **zero
+  references** in the image (code or data) — the game's Steam Networking Sockets
+  acquisition is compiled out. The plain Steam bootstrap is live
+  (`FUN_1400ba630`: `SteamAPI_RestartAppIfNecessary`, `SteamInternal_SteamAPI_Init`).
+- **`JOIN_SESSION`** (RVA `0x19897B0`) is built by `FUN_1413a8ae0`, a **virtual
+  in `StateMatchmaking::vftable`** (RVA `0x19886C8`), as a `TelemetryLaunchAction`
+  tagged `"invitation"`. `IN_PRELOBBY`/`RUNNING`/`IN_POSTLOBBY` are formatted by
+  `FUN_140d6faf0` ("Round state { State: %s }").
+- **Co-op script keys are wired via data tables** (raw pointer scan; Ghidra's
+  initial "no xref" was a data-ref artifact): `MaxCoopPlayerCount` →
+  `.data 0x1EC1AC8`, `CoopShared` → `.data 0x1F48C90`,
+  `CoopPlayerControllerDisconnected` → `.data 0x1FC8728`,
+  `host unreachable` → `.rdata 0x176C648`.
+- **`NetGameDummy`** ("NETGAME 'DUMMY_ONLINE' GAMENAME"): factory `FUN_140d96060`
+  builds 0x3CA8-byte session objects; no direct CALL xrefs (indirect-only),
+  only referrer of all four `NetGameDummy` vtables.
+- **Renderer = D3D12** (static proof): exports `D3D12SDKPath`/`D3D12SDKVersion`/
+  `NVSDK_NGX_D3D12_*`; install root ships DX12 FSR/DLSS + DirectStorage. Matters
+  for JustAddMP (D3D11-only Present hook).
+- Reachability verdict: **NoOp is the wired path; the real session manager and
+  the game's P2P transport init do not exist as code**; matchmaking/party/state
+  objects exist and are constructed, sitting above the NoOp. Written up as the
+  core evidence in [DECISION.md](DECISION.md).
+
+## Strikers RVA verification (observed, 2026-10-20)
+
+Script `local/verify_strikers_rva.py` (pefile) — **18/19 documented checks pass
+byte-exact**; details table in [DECISION.md](DECISION.md). Highlights:
+
+- Patch-site byte rows from `docs/memory-tables.md` all match exactly
+  (`0xE39A41`→`80 79 28 00 74 52`, `0xE54F95` 19-byte coin-flip run,
+  `0xE45F8E`, `0xE025A5`, `0xE04FCD`, `0xE3B8B9`, `0xE01E4F`, `0xE050D9`,
+  `0xE3F680`, `0xE404F0`).
+- Vtable slot `0x190D718` holds exactly `0x140E3F3B0` as documented.
+- RTTI behind vtables resolves to the documented class names
+  (`.?AVBoardGameChallengeInstance@@`, `.?AVAIBoardGamePlayer@@`,
+  `.?AVBoardGameUnitCollectionComponentResource@@`, `.?AVRTTIObject@@`).
+- The one "FAIL" was my checker's assumption, not a mismatch: the doc's
+  "type description at RVA `0x21769D0`" is a Decima class-info record
+  (present at exactly that RVA), not an MSVC TypeDescriptor.
+- Steam build id discrepancy resolved as far as bytes allow: same exe content
+  at every sampled location + identical PE identity → Strikers' `14835813` vs
+  our recorded `13801562` is a depot/manifest recording difference, not a
+  different binary. Strikers refuses writes unless the runtime build matches —
+  copy that guard.
+- Strikers has **0 GitHub issues** and no docs besides `memory-map.md` /
+  `memory-tables.md` (checked 2026-10-20); README covers release-hash checking
+  only.
+
 ## Workspace (phase 2, partial — cheapest correct option)
 
 - Isolated workspace: `local/workspace/hfw-binaries/` — a **binaries-only copy**
@@ -145,41 +228,48 @@ Scan: `local/pe_scan.py` (Python + `pefile` 2024.8.26, already on PATH) against
   *runtime* phase (two instances): full `robocopy` copy to another drive, then
   hardlinked instance pairs (methods.md §2) so each instance has its own config/saves —
   decision deferred to when a runtime test is actually scheduled.
-- Tools present (checked 2026-10-20): Python 3.14 + `pefile`, Java 17 (Ghidra-ready),
-  Rust/cargo, .NET SDK, git, gh CLI (authenticated). Missing: Ghidra, `strings`, DIE,
-  7z, MSVC cl. Nothing installed this session (scan used what was already there).
+- Tools present (checked 2026-10-20): Python 3.14 + `pefile`, Java 17, Rust/cargo,
+  .NET SDK, git, gh CLI (authenticated). **Installed later this session** (see
+  "Phase 3 (complete)" above): Ghidra 12.1.4 + Temurin JDK 21 inside `local/`.
+  Still missing: `strings`, DIE, 7z, MSVC cl.
 
 ## Derived (labelled guesses)
 
-- **Path 2 (build from zero) still stands**, but the cost dropped: the retail exe keeps
-  the whole co-op stack (session/party/matchmaking/replication + script exports), so the
-  plan is to check whether those paths can be re-driven (see Unknown) rather than
-  designing netcode from nothing. Phase 4 will choose between: (a) revive engine net
-  layer, (b) JustAddMP core game module, (c) own transport feeding the `Net*State`
-  replication classes puppet-style (Strikers pattern).
-- Strikers' published RVAs likely match our exe (identical PE timestamp + SizeOfImage) —
-  *assumed*, not yet verified against a single function.
+- **Route chosen: (c) own transport + injected module feeding the `Net*State`
+  structures puppet-style** (Strikers pattern), with route (a) reduced to an
+  *intel* source (the NoOp vtable is the engine's session interface; constructed
+  matchmaking objects are a later accelerant) and route (b) parked pending
+  JustAddMP license + a D3D12 hook. Reasoning in [DECISION.md](DECISION.md).
+- The dormant layer's real/NoOp split is a **link-time decision**, not a runtime
+  config: party/matchmaking/state survived in the image, the session manager and
+  Steam-sockets acquisition did not.
+- `NetGameDummy` (0x3CA8-byte object) is *assumed* to be the local/dummy session
+  object the dormant online mode would run — factory is indirect-only, unconfirmed.
 
 ## Unknown
 
-- Whether any `Net*`/lobby/matchmaking path is **reachable at runtime** in the retail
-  single-player build, or compiled-out behind `NetSessionManagerNoOp` — needs a runtime
-  trace or Ghidra headless cross-reference pass.
+- Whether anything pumps `Net*State` replication during a normal single-player
+  run (if not, treat those classes as data we serialize ourselves).
 - Whether the game's WS2_32 usage includes a live UDP transport or only telemetry/
-  telemetry-over-TCP + WinHTTP.
-- Steam buildId discrepancy: our `flt.ini` says 13801562, Strikers documents 14835813
-  for build `667B1777-949F000` — same exe identity, different recorded build id; verify
-  one documented RVA (`g = [base + 0x8983150]` chain) before trusting the memory map.
+  telemetry-over-TCP + WinHTTP (socket call sites not yet mapped).
+- Which renderer the game creates at runtime by default (static evidence: D3D12 —
+  exports + DX12 upscalers; confirm before choosing overlay/hook layer).
+- What invokes `FUN_140d96060` (NetGameDummy factory) and `FUN_1400ba630`
+  (Steam bootstrap) — both indirect-only today.
+- What backend the `StateMatchmaking`/telemetry paths expect (`host unreachable`
+  message table) — gone services vs local.
 - JustAddMP/core license (none stated) — matters before building on it (rule 7).
 - Whether Decima's async/strand-like structures exist in HFW (Death Stranding does).
 
 ## Not tried (next session)
 
-- Ghidra headless import + decompile-all of the exe (Java 17 ready; install into
-  `local/`, follow methods.md: background run, long timeout, output kept in project).
-- Runtime launch of the workspace copy (needs full install or instance plan), socket
-  activity observation, single-instance mutex survey for two copies.
-- Verify one Strikers RVA against our binary to unlock its memory map.
+- Runtime launch of the workspace copy (needs full install or instance plan),
+  socket activity observation, single-instance mutex survey for two copies.
+- Phase 5 first milestone: injected module that logs per frame + reads the local
+  player's transform/world id (how-coop-mods-work.md stage 1 exit test), with a
+  runtime build-id guard copied from Strikers.
+- Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
+- Ask JustAddMP/core author about a license (owner approval for contact).
 
 ## Sources
 
