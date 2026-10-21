@@ -1,6 +1,6 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, spawn call stays blocked** (2026-10-21) — the BSS
+Status: **phase 5, SLOT LIVE, spawn call stays blocked** (2026-10-21) — `--read-slot` after a loaded save saw `GameModule+0x50` non-null for all 40 samples, and `[that+0x20]` non-null too. The BSS
 qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
 stores a `NetErrorHandlerGame*` built at startup, and `+0xF8` on that
@@ -1151,56 +1151,75 @@ not have `+0x50` filled by `FUN_140d5e2c0`.
 wants is still one field further, `[that+0x20]`, which `FUN_14134c950`
 loads at `0x134C9FE`. This session did not read it from a live process.
 
-### `--read-slot` (2026-10-21, built, not injected)
+### `--read-slot` runtime (2026-10-21, owner, save loaded)
 
-Opt-in flag on the same loader. Default sampler is unchanged (mode
-byte 0, 10 Hz, 45 s). `--spawn-once` is unchanged (mode byte 1): it
-still logs the block and does not call `FUN_14134c950`. `--read-slot`
-writes mode byte 2 beside the DLL, not under `M:\`.
-
-Gate: the `GameModule*` at RVA `0x8983150` (VA `0x148983150`) becoming
-non-null. `NOTES` does not treat `[PlayerManagerGame+0x08] >= 1` as
-"a save is loaded" for this slot. That count is the player list. The
-`+0x50` store runs from `GameModuleStateLoading::vftable+0x30` after
-the publish, so the gate is the published pointer itself. The thread
-waits up to 60 s at 2 Hz for it, then samples 20 s at 2 Hz.
-
-Each sample is one `memcpy` per qword, inside SEH, and one log line:
+The owner loaded a save, then from `probe\bin\Release\net10.0`:
 
 ```
-slot module=0x.. plus50=0x.. entity=0x..
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--read-slot'
 ```
 
-`plus50` is `[module+0x50]`. `entity` is `[[module+0x50]+0x20]` only
-when `plus50` is non-null, otherwise `0`. No game function is called.
-The double3 is not written.
+No inject and no launch from this session. The game directory was
+read, not written. The log was copied to `local/hfw-probe-slot.log`
+(git-ignored). The sidecar beside the exe says `read-slot flag seen`,
+`hash ok`, `process found pid=22384`, `injected mode=read-slot`.
+`--spawn-once` was not this run.
 
-Success criterion: after a save is loaded, at least one of those lines
-has `plus50` non-null (`plus50=0x0` is the slot still empty). `entity`
-non-null on the same line is the pointer `PlayerGame`'s constructor
-wants; it is recorded, not used.
+42 lines: one start line, 40 `slot` lines, one stop line. No `fault`
+line. `faults=0`. First, middle (line 21 of 40), and last are the
+same three pointers:
 
-The loader returns as soon as `LoadLibraryW` returns. The shell does
-not wait the 20 s. The lines land in `hfw-probe.log` in the game's
-working directory. If that file is missing, the refusal is
-`hfw-probe-run.txt` beside the exe (`read-slot flag seen` or
-`read-slot flag absent`). This mode does not spawn and does not hitch:
-it only reads three qwords and sleeps 500 ms.
+```
+slot module=0x2357D4C2A00 plus50=0x23109E3E4D0 entity=0x23111517280
+slot module=0x2357D4C2A00 plus50=0x23109E3E4D0 entity=0x23111517280
+slot module=0x2357D4C2A00 plus50=0x23109E3E4D0 entity=0x23111517280
+read-slot stop samples=40 faults=0
+```
 
-Selftest already checks the store (`48 89 5F 50` at `0xD63090`) and
-the load (`48 8B 3D DA 00 C2 07` at `0xD6306F`). No new anchor. Not
-injected and not launched this pass.
+40/40 have `plus50 != 0`. 40/40 have `entity != 0`. All 40 lines are
+byte-identical: `module` `0x2357D4C2A00`, `plus50` `0x23109E3E4D0`,
+`entity` `0x23111517280`. Nothing changed across the 20 s at 2 Hz.
+The reader did not fault, and the module pointer did not stay 0.
+
+**SLOT LIVE.** `GameModule+0x50` is the object
+`MOV [RDI+0x50], RBX` at RVA `0xD63090` stores, and it stayed
+non-null for the whole sample. `entity` is also non-null: that is
+`[[module+0x50]+0x20]`, the pointer `FUN_140d73270` stores at
+`Player+0x30`. It was recorded, not passed to anything.
+`--spawn-once` stays blocked. `FUN_14134c950` was not called.
+
+### Next milestone (documented, not implemented)
+
+A second `PlayerGame` can be constructed with
+`FUN_140d73270(this, entity)` using that entity pointer
+(`0x23111517280` this run), then inserted via the virtual
+`FUN_140d8c2d0` (`PlayerManagerGame::vftable+8`). That call was not
+written.
+
+The missing piece is who allocates the `PlayerGame` and the calling
+convention of the constructor. The only allocator the existing
+decompile names for this record is `FUN_1401e6100` inside
+`FUN_14134c950` (`0x134CA82`), size `0x210` from the static type
+record at RVA `0x21615A0`, and that function is the one that faults
+on null `[0x1489581F0]`. `FUN_140d73270` itself is
+`PlayerGame*(RCX=this, RDX=entity)`: it forwards `RDX` into
+`FUN_140913be0`, which stores it at `[this+0x30]` (`MOV [RDI+0x30],
+RBX` at `0x913CB7`). Microsoft x64, two register args, return in
+`RAX`. Do not call it until the allocation is separated from
+`FUN_14134c950`. Do not re-enable that function. Do not emit
+`FUN_140d8c2d0`.
 
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised again: `--read-slot` is the read. Success is
- a log line `slot module=0x.. plus50=0x.. entity=0x..` with `plus50`
- non-null after a save. The entity argument remains `[that+0x20]`.
- Do not call `FUN_14134c950`. Do not write the double3. Do not
- call `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
- `FUN_140d8c2d0`.
+- Milestone 2, revised: the slot is live and `entity` is non-null
+ (see the runtime above). Next is the allocator of a `PlayerGame`
+ outside `FUN_14134c950`, then `FUN_140d73270(this, entity)` and the
+ insert virtual `FUN_140d8c2d0`. Documented only. Do not call
+ `FUN_14134c950`. Do not write the double3. Do not call
+ `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
+ `FUN_140d8c2d0` until the allocation is named.
 
 ## Sources
 
