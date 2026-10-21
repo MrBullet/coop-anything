@@ -1,7 +1,10 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5 milestone 1 built** (2026-10-21) — read-only probe
-(`probe/`) with an offline RVA selftest that passes against the workspace exe.
+Status: **phase 5 milestone 1 probed live** (2026-10-21) — the injected
+read-only sampler ran 1,500 samples. The entity pointer is stable. The
+float Vec3 at `entity+0xD8` is not a transform, and `[[scene+0x248]]` is a
+counter, not a world id. The 30 Hz `fflush` loop stalled the game; the
+sampler is now 10 Hz. Offline selftest still 11/11.
 Runtime injection is blocked: Steam has no library entry for this install, so
 `-applaunch` does not start the game. Manual steps below. Claim issue:
 cranebeaker/coop-anything#83. Route **(c)** — see [DECISION.md](DECISION.md).
@@ -305,10 +308,13 @@ Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
 
 `games/horizon-forbidden-west/probe/`:
 
-- `hfw_probe.c` — injected DLL. On attach it spawns a thread that, 30 times a
- second for ~50 s, reads the chain above and appends
- `frame world=0xXXXXXXXX entity=0xXXXXXXXXXXXXXXXX pos=(x,y,z) heading=h`
- to `hfw-probe.log`. It never writes game memory; every read is in `__try`.
+- `hfw_probe.c` — injected DLL. `DllMain` only creates a thread. The thread
+ samples at 10 Hz (`Sleep(100)`, 450 samples, below-normal priority), reads
+ the chain, and writes `hfw-probe.log`. It never writes game memory, never
+ hooks `Present`, and never calls a game function. Every pointer deref is
+ one `memcpy` inside `__try`. A bad read logs one `fault` line and the loop
+ continues. Each sample logs `entity+0xD8` both as three floats and as three
+ doubles, plus a `sane=` flag (finite and inside ±1e7).
 - `hfw-probe.cs` — loader. Refuses to run unless the exe's SHA-256 is
  `9cec6626…02055429e` **and** the PE stamp is `667B1777-949F000` (Strikers'
  guard plus the hash). `--selftest` checks the anchor bytes above, including
@@ -326,32 +332,85 @@ dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
 11/11 PASS against the binaries-only workspace copy of the exe: SHA-256 + PE
 guard, the three Strikers rows, and all six anchors above.
 
-### Runtime test (blocked — manual steps)
+### Runtime test (2026-10-21, owner launched the game)
+
+The owner injected the first build (`hfw-probe.exe --seconds 45`, pid 25980).
+The DLL wrote 1,500 lines and then stopped. No access-violation line. The
+game froze: alt-tab showed the pause menu, and Continue did not return
+control. The process was already gone by the time this session looked; it
+was not killed from here, and saves were not touched.
+
+Quoted from `<game dir>\hfw-probe.log` (first line and last line; all 1,500
+match this shape):
+
+```
+frame world=0x00002280 entity=0x18EF75A0380 pos=(-268433330386265072951800722111395266560.000,5.732,-39718163054592.000) heading=-426513958130057668028530688.000
+frame world=0x000032AC entity=0x18EF75A0380 pos=(-268433330386265072951800722111395266560.000,5.732,-39718163054592.000) heading=-426513958130057668028530688.000
+```
+
+What that is, and what it is not:
+
+- One stable entity pointer, `0x18EF75A0380`, for the whole run. The walk
+ `PlayerManagerGame* -> [pm+0x10] -> [player+0x48]` did reach a live object.
+- `world` is not a world id. It moved `0x2280 -> 0x32AC` (+4140 over 1499
+ samples, about +2 or +4 per 33 ms). That is a counter at
+ `[[scene+0x248]]`, not a loaded-world resource id.
+- The position is not a transform. Y as a float is `5.732`
+ (`0x40B76C8B`). X and Z are `0xFF49F261` and `0xD6107E6C`, which are not
+ finite game coordinates. Read as a double, the first qword is
+ `5996.547` and the second is an overflow. `FUN_140d4f750` copies three
+ qwords from `+0xD8/+0xE0/+0xE8` (the `vmovups`/`vmovsd` at RVA `0xD4F8D4`
+ is that copy, and `RBP` there is reassigned before the load). A
+ `WorldPosition` (`FUN_1401cba60`) is three doubles. Neither layout is
+ confirmed by this log.
+
+Why it froze: not a loader lock, not a hooked `Present` (the DLL never
+hooked one), not a suspended thread, and not a write. `DllMain` only
+called `CreateThread`. The worker then `fprintf` + `fflush` of a ~200 byte
+line, 30 times a second, into the game's own working directory, for all
+1,500 samples. That is synchronous disk IO on a thread inside the game
+process, and the logged `world` counter kept moving, so the process was
+not deadlocked — it was stalled hard enough that focus changes dropped it
+into the pause menu and Continue never got back to the sim. The sampler
+is now 10 Hz, one flush per sample, 450 samples, `THREAD_PRIORITY_BELOW_NORMAL`.
+
+A targeted `-noanalysis` pass on the existing Ghidra project
+(`local/ghidra_scripts/FixPlayerChain*.java`, reports `local/fix_player_chain*.txt`)
+confirmed the entity getter and rejected the float Vec3. No new anchor was
+written into the DLL. The next live log has to show `sane=1` on the `f64=`
+triple before this is a player transform.
+
+### Runtime test (blocked — manual steps, superseded)
 
 Steam is logged in, but `steamapps/libraryfolders.vdf` lists only `C:`, `E:`,
 `K:`, `D:`. The install is on a drive that is not one of them, and
 `steam.exe -applaunch 2420110` logged `ExecCommandLine` and started nothing
-(no game process after 20 s). Launching the exe directly would trip
+(no game process after 20 s). The owner later launched the game themselves;
+see the runtime test above. Launching the exe directly would trip
 `SteamAPI_RestartAppIfNecessary` and restart through Steam, which fails the
-same way. No second attempt made; the game was not left running.
+same way. `<game dir>` was not written.
 
 The save under `%USERPROFILE%\Documents\Horizon Forbidden West Complete Edition\`
 (one `profile.dat`, 197,012 bytes) was copied into `local/` before the launch
-attempt. `<game dir>` was not written.
+attempt.
 
 To run it:
 
 1. Add the install's drive as a Steam library folder (Steam → Settings →
  Storage → Add Drive), so app 2420110 resolves.
 2. Start the game and load a save so a player entity exists.
-3. From `probe/`: `hfw-probe.exe --exe "<game dir>\HorizonForbiddenWest.exe" --seconds 45`.
- The loader checks the hash, injects `hfw_probe.dll`, and the log appears as
- `hfw-probe.log` in the game's working directory.
+3. From `probe/bin/Release/net10.0`:
+ `hfw-probe.exe --exe "<game dir>\HorizonForbiddenWest.exe" --seconds 45`.
+ The loader checks the hash, injects `hfw_probe.dll`, and waits. The log is
+ `hfw-probe.log` in the game's working directory. A good sample has `sane=1`
+ and an `f64=(x,y,z)` in metres. `sane=0` means the qword layout is still
+ wrong — do not keep the game running to retry.
 4. Close the game. Do not leave it running.
 
 ## Not tried (next session)
 
-- Runtime confirmation of the chain (needs the Steam library entry above).
+- Runtime confirmation of a real transform (`sane=1` on the `f64` triple).
+ The entity pointer is live; the Vec3-float read is not.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).

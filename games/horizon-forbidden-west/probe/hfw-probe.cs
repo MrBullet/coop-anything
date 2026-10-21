@@ -1,7 +1,8 @@
 // hfw-probe — phase 5 milestone 1.
 //
-// Read-only injected module. Per frame it logs the local player's transform
-// and the loaded world id. It never writes game memory.
+// Read-only injected module. The DLL samples at 10 Hz from its own thread.
+// It never writes game memory, never hooks Present, and never calls a game
+// function. The loader does not attach a console to the game process.
 //
 // Injection pattern (Strikers, MIT, github.com/everydayaussie/Strikers):
 // an external .NET process OpenProcess's HorizonForbiddenWest.exe, checks the
@@ -21,16 +22,11 @@
 //   player = [storage]
 //     +0x48             Entity*          (FUN_140916bf0)
 //   entity
-//     +0xD8             Vec3 position    (vmovups at RVA 0xD4F8D4)
-//     +0xE8             8 bytes, heading (vmovsd  at RVA 0xD4F8DC)
-//   gSceneManagerGame   RVA 0x8982DD0   SceneManagerGame*
-//     +0x248            loaded-world resource*
-//     resource +0x00   world id (uint32)
-//
-// Frame hook: IDXGISwapChain::Present vtable slot 8, resolved from the
-// swap chain the game already created (no byte patches, hook is restored
-// on unload). Present is the per-frame signal; the body only reads.
-
+// entity+0xD8 is three qwords (FUN_140d4f750 copies +0xD8/+0xE0/+0xE8).
+// WorldPosition (FUN_1401cba60) is three doubles. The live 2026-10-21
+// log read them as floats and got garbage. The DLL logs both layouts.
+// gSceneManagerGame RVA 0x8982DD0. +0x248 counted 0x2280 -> 0x32AC
+// on that run, so it is a uint32 and not a stable world id.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -50,8 +46,7 @@ internal static class Program
     private const int OffListStorage = 0x10;
     private const int OffPlayerEntity = 0x48;
     private const int OffEntityPos = 0xD8;
-    private const int OffEntityHeading = 0xE8;
-    private const int OffSceneWorld = 0x248;
+       private const int OffSceneWorld = 0x248;
 
     private const uint ProcessVmRead = 0x0010;
     private const uint ProcessQueryInformation = 0x0400;
@@ -189,13 +184,14 @@ internal static class Program
         if (entity == 0)
             return $"frame world={world} player=0x{player:X} entity=null";
 
-        var pos = ReadBytes(handle, entity + OffEntityPos, 12);
-        var head = ReadBytes(handle, entity + OffEntityHeading, 8);
-        var x = BitConverter.ToSingle(pos, 0);
-        var y = BitConverter.ToSingle(pos, 4);
-        var z = BitConverter.ToSingle(pos, 8);
-        var heading = BitConverter.ToSingle(head, 0);
-        return $"frame world={world} entity=0x{entity:X} pos=({x:F3},{y:F3},{z:F3}) heading={heading:F3}";
+        var raw = ReadBytes(handle, entity + OffEntityPos, 24);
+        var dx = BitConverter.ToDouble(raw, 0);
+        var dy = BitConverter.ToDouble(raw, 8);
+        var dz = BitConverter.ToDouble(raw, 16);
+        var fx = BitConverter.ToSingle(raw, 0);
+        var fy = BitConverter.ToSingle(raw, 4);
+        var fz = BitConverter.ToSingle(raw, 8);
+        return $"frame world={world} entity=0x{entity:X} f64=({dx:F3},{dy:F3},{dz:F3}) f32=({fx:F3},{fy:F3},{fz:F3})";
     }
 
     private static string WorldId(nint handle, ulong scene)
