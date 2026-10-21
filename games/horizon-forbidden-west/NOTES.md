@@ -2781,6 +2781,106 @@ until that register is named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140a8b1d0` appends a job object, not an entity (2026-10-21)
+
+Offline only. Three `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/SceneAppend.java`, `SceneAppendCallers.java`,
+`SceneAppendWho.java`, plus `SceneDrain.java` for the consumer;
+reports `local/scene_append.txt`, `local/scene_append_callers.txt`,
+`local/scene_append_who.txt`, `local/scene_drain.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. No call frame is complete, so nothing
+was emitted.
+
+`FUN_140a8b1d0` is 86 bytes and returns void. It does not read `RCX`
+or `R8`. The only argument it keeps is `RDX`:
+
+```
+RVA 0xA8B1DF MOV RDI,qword ptr [0x148982dd0] ; SceneManagerGame*
+RVA 0xA8B1E6 MOV RSI,RDX ; the only argument
+RVA 0xA8B1E9 LEA RBX,[RDI + 0x1c0] ; exclusive SRWLOCK
+RVA 0xA8B1F9 LEA RCX,[RDI + 0x1b0]
+RVA 0xA8B200 MOV RDX,RSI
+RVA 0xA8B203 CALL 0x1400fe310
+```
+
+`RCX` of the inner call is the counted array. `RDX` is the pointer
+the caller passed. `R8` is not an argument.
+
+`FUN_1400fe310` (133 bytes) appends that pointer. It is not a search.
+It increments the count, grows the buffer by 8-byte slots when the
+capacity at `+0x4` is exceeded, and writes the pointer at the old
+index:
+
+```
+RVA 0xFE325 MOVSXD RBP,dword ptr [RCX] ; count
+RVA 0xFE32B MOV R14,RDX ; the pointer
+RVA 0xFE32E LEA ECX,[RBP + 0x1]
+RVA 0xFE331 MOV dword ptr [RSI],ECX ; count = count + 1
+RVA 0xFE333 CMP ECX,dword ptr [RSI + 0x4] ; capacity
+RVA 0xFE35A LEA EAX,[RBX*0x8] ; grow, 8 bytes per slot
+RVA 0xFE364 CALL 0x1401e6260
+RVA 0xFE385 MOV qword ptr [RCX + RBP*0x8],R14 ; append
+```
+
+The array at `SceneManagerGame+0x1b0` is therefore a counted pointer
+vector: count at `+0x1b0`, capacity at `+0x1b4`, data at `+0x1b8`,
+stride 8, element a pointer. The lock sits at `+0x1c0`. The element
+is not an `Entity*` and not a `0x38` node.
+
+Both code callers pass their own `this`, saved from `RCX` into `RBP`
+at the entry, and that object already owns a different counted array
+of `0x18`-byte records at `+0x1d8`:
+
+| call | function | what RDX is |
+|---|---|---|
+| `0xA9B596` | `FUN_140a9b480` (421 bytes) | `MOV RBP, RCX` at `0xA9B4B8`, then `MOV RDX, RBP` |
+| `0xA9B46F` | `FUN_140a9b340` (314 bytes) | `MOV RBP, RCX` at `0xA9B34C`, then `MOV RDX, RBP` and a tail `JMP` |
+
+`FUN_140a9b340` is the enqueue: it grows `[this+0x1e0]` by `0x18`
+(`LEA RDX, [RAX+RAX*2]; SHL RDX, 3` at `0xA9B3D6`) and stores a
+pointer plus 16 bytes of payload. `FUN_140a9b480` drains that queue
+and only then calls `FUN_140a8b1d0`, and only after 25 passes
+(`CMP R14D, 0x19` at `0xA9B57A`). The data xref at `0x8C0CE94` is a
+packed pair of RVAs (`0xA8B1D0` in the low dword), not a call.
+
+The consumer of the scene array is `FUN_140d6bce0` (397 bytes). It
+takes the exclusive lock, steals the vector, and calls
+`FUN_140a9b480` on each pointer:
+
+```
+RVA 0xD6BD86 MOV RDI,qword ptr [0x148982dd0]
+RVA 0xD6BD9D MOVSXD R14,dword ptr [RDI + 0x1b0] ; count
+RVA 0xD6BDA4 MOV RSI,qword ptr [RDI + 0x1b8] ; data
+RVA 0xD6BDAB MOV qword ptr [RDI + 0x1b0],R13 ; clear
+RVA 0xD6BDB2 MOV qword ptr [RDI + 0x1b8],R13
+RVA 0xD6BDD3 MOV RCX,qword ptr [RBX]
+RVA 0xD6BDD6 CALL 0x140a9b480
+RVA 0xD6BDDB ADD RBX,0x8
+```
+
+An allocated `ControlledEntity` (size `0x300`) does not have that
+queue. Passing it as `RDX` would make the drain read `entity+0x1d8`
+and `entity+0x1e0`. Miss. The globals we already hold
+(`SceneManagerGame*`, `EntityManagerGame*`, `GameModule*`,
+`PlayerManager*`) plus the allocated entity do not fill this call.
+No call frame.
+
+The single next decompile is `FUN_140a9b780` (207 bytes), called from
+the drain at `0xA9B54A` as `(RCX = the job, RDX = [record+0],
+R8 = record+8)`. Its first use of `RDX` is `CALL qword ptr [RDX]`
+at `0xA9B7AC`, then a word at `[RAX]` and a byte at `[RAX+0x5]`. The
+question is whether that `RDX` is the `Entity*` the job was queued
+with. The enqueue sites (`FUN_140a9f910` at `0xA9F9EC` and the same
+shape in `FUN_140a9fc10`, `FUN_140cb5ff0`, `FUN_140d502d0`) recover a
+pointer with `LEA RBP, [RAX-0x20]` at `0xA9F938` from `[arg+0x38]`
+before they build the `0x18` record. Do not decompile those until
+`FUN_140a9b780` names `RDX`.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
