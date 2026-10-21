@@ -2444,6 +2444,132 @@ decompile is `FUN_140ad5480`, the insert into `[parent+0x220]` at
 `0x94B1A5`: name that list, and whether it is the scene's entity
 array or only the parent's children. No call until that is named.
 
+### `[parent+0x220]` is a per-parent node array (2026-10-21)
+
+Offline only. Three `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/ListInsert.java`, `EmSlots.java`,
+`EmSlots2.java`; reports `local/list_insert.txt`,
+`local/em_slots.txt`, `local/em_slots2.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. No call frame is complete, so nothing was emitted.
+
+`FUN_140ad5480` is 1711 bytes. The call at `0x94B1A5` fills four
+arguments, and the factory's `0` flag takes the first arm:
+
+```
+RVA 0x94B195 LEA RCX, [RDI + 0x220] ; the container
+RVA 0x94B19C XOR R9D, R9D ; flag, 0
+RVA 0x94B19F MOV R8, RBX ; the child entity
+RVA 0x94B1A2 MOV RDX, RDI ; the parent entity
+RVA 0x94B1A5 CALL 0x140ad5480
+```
+
+Inside, `RCX` is saved at `0xAD548C`, `R9D` at `0xAD548F`, `R8` at
+`0xAD5499`, `RDX` at `0xAD549C`. It takes the SRW lock at
+`0x148956828` (`0xAD549F`) and returns immediately when the parent
+and the child are the same pointer (`CMP R15, R14` / `JZ 0x140ad5b15`
+at `0xAD54B6`).
+
+The container is not the sibling list. The sibling list is two
+qwords, `parent+0x88` the head and `child+0x90` the next child, both
+written by `FUN_14094afe0` itself. `[parent+0x220]` is a counted
+array of `0x38`-byte nodes, and the child entity is not one of those
+nodes. The array header sits `0x18` bytes before the pointer the
+caller passes:
+
+```
+RVA 0xAD54ED MOV RBX, [R13 + 0x20] ; data, so parent+0x240
+RVA 0xAD54F1 LEA RBP, [R13 + 0x18] ; header, so parent+0x238
+RVA 0xAD54F5 MOVSXD RAX, dword ptr [RBP] ; count
+RVA 0xAD54FB IMUL RDX, RAX, 0x38 ; stride
+```
+
+Each node stores the entity as a pointer plus `0x20`, not the
+entity. The scan compares `[node+0] - 0x20` with the child
+(`LEA RAX, [RCX-0x20]` / `CMOVZ` / `CMP RAX, R14` at `0xAD5516`),
+and a new node is built the same way (`LEA RAX, [R14+0x20]` at
+`0xAD556E`, stored at `[RSP+0x20]`). The push copies that stack
+record into the array:
+
+```
+RVA 0xAD5A2D LEA RDX, [RSP + 0x20] ; the stack node
+RVA 0xAD5A32 MOV RCX, RBP ; parent+0x238
+RVA 0xAD5A35 CALL 0x140add0b0
+```
+
+`FUN_140add0b0` (318 bytes) grows the array by `0x38` through
+`FUN_1401e6100` (`IMUL RCX, RAX, 0x38` / `CALL 0x1401e6100` at
+`0xADD10B`) and copies one record with `FUN_140ad45f0`. That copy
+writes seven fields and nothing else (`0xAD4604` through
+`0xAD4637`): `[node+0x00]` the entity-plus-`0x20` pointer, `[+0x08]`
+and `[+0x10]` zero, `[+0x18]` the node's own address, `[+0x20]` and
+`[+0x28]` qwords, `[+0x30]` and `[+0x34]` dwords. The matching
+remove, `FUN_140ad5f40` at `0x94B100`, walks the same
+`count * 0x38` array (`0xAD5F84`) and the same `pointer - 0x20`
+test (`0xAD5FA6`). So `[parent+0x220]` is this parent's node array.
+It is not a scene-wide entity list: the only entity it records is
+the child, and only as a field of a wrapper allocated for this
+parent.
+
+`EntityManagerGame::vftable` is the qword at RVA `0x18FB560`. The
+Complete Object Locator at vtable minus 8 is `0x141A85628`, the same
+one already named `.?AVEntityManagerGame@@`. Slots 0 through 15,
+read as qwords, not only the first six:
+
+| slot | offset | RVA | what it is |
+|---|---|---|---|
+| 0 | `+0x00` | `0x900B10` | `FUN_140900b10`, 78 bytes, 3 calls |
+| 1 | `+0x08` | `0x4FAE0` | `FUN_14004fae0`, 3 bytes |
+| 2 | `+0x10` | `0xD5B880` | `FUN_140d5b880`, 106 bytes |
+| 3 | `+0x18` | `0xD5B960` | `FUN_140d5b960`, 1504 bytes |
+| 4 | `+0x20` | `0xD5B8F0` | `FUN_140d5b8f0`, 102 bytes |
+| 5 | `+0x28` | `0xD5C110` | `FUN_140d5c110`, 16 bytes |
+| 6 | `+0x30` | `0xD5BF50` | `FUN_140d5bf50`, 437 bytes |
+| 7 | `+0x38` | `0x1A865F8` | not a function; the bytes there are not ASCII |
+| 8 | `+0x40` | `0xD5C9F0` | `FUN_140d5c9f0`, 43 bytes |
+| 9 | `+0x48` | `0x61890` | `FUN_140061890`, 6 bytes |
+| 10 | `+0x50` | `0x503C0` | `FUN_1400503c0`, 3 bytes |
+| 11 | `+0x58` | `0x503C0` | same 3-byte function |
+| 12 | `+0x60` | `0x134B830` | `FUN_14134b830`, 550 bytes |
+| 13 | `+0x68` | `0x134BAA0` | 19-byte thunk to `FUN_1413ce4e0` |
+| 14 | `+0x70` | `0x134BAC0` | `FUN_14134bac0`, 245 bytes |
+| 15 | `+0x78` | `0x42700` | `_guard_check_icall`, 3 bytes |
+
+None of them inserts an entity. Slot `+0x18` (`FUN_140d5b960`)
+returns at `0xD5B963` when `RDX` is null, then reads `[R8+0x20]` at
+`0xD5B9B6` and calls `FUN_1408f9890` at `0xD5B9D4`. The `0x90` at
+`0xD5B9E0` and the `LEA RCX, [R13+0xC8]` at `0xD5BEC0` are offsets on
+a pointer that argument produced, not a store of an entity into a
+list. Slot `+0x20` (`FUN_140d5b8f0`) forwards `RDX` and `R8` to
+`FUN_140d70aa0` at `0xD5B946`; its `+0x88` and `+0x90` loads are
+`[RCX+0x88]` at `0xD5B913` and `[RAX+0x90]` at `0xD5B92A` on other
+objects. Slot `+0x30` (`FUN_140d5bf50`) walks the player list already
+mapped, `[PlayerManager+0x10]` for `[PlayerManager+0x8]` entries
+(`0xD5BFAD`, `0xD5BFB5`), and reads `[player+0xC8]` and `[player+0xE8]`
+(`0xD5BFDD`, `0xD5BFF7`). It does not push. Slot `+0x60`
+(`FUN_14134b830`) does call the allocator, but the size comes from a
+script value (`CALL 0x1401e6100` at `0x134B934`) and the pointer is
+stored to the global `0x148982AF8` (`0x134B952`), then
+`FUN_140d61c00` is called on `GameModule*` (`0x134B9A4`). The fresh
+entity is not an argument. Slot `+0x70` (`FUN_14134bac0`) is the
+function already traced to `GameModuleStateLoading`: it calls
+`FUN_14134c4e0` (`0x134BAC9`) and tails into `FUN_14134bbc0` at
+`0x134BB29`. The `+0xD8` hit is a load, `MOV RCX, [RCX+0xD8]` at
+`0x134BB11`, on the object at `[[0x1489581F0]+0xF8]`.
+
+Miss. No slot of this vtable takes `EntityManagerGame*` and an entity
+pointer and inserts that entity. The node array at `[parent+0x220]`
+needs the parent entity in `RDX`, which we do not have without the
+owner's entity, so that call is not fillable either. The single next
+decompile is `FUN_140d5b960` (vtable slot `+0x18`): name `RDX` and
+`R8` at `0xD5B960`, and say whether the pointer it builds at
+`0xD5B9EB` is an entity it registers or a field of an argument it was
+given. No call until those two registers are named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
