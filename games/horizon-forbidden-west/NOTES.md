@@ -2301,6 +2301,153 @@ that stack slot: which instruction in `FUN_1401f62a0` writes
 `entity+0xD8` stays unwritten, `--add-player` stays alloc-only and
 `--link-puppet` stays as shipped.
 
+### `FUN_14094afe0` parents an entity; it does not register one (2026-10-21)
+
+Offline only. Five `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegAfe0.java`, `SpawnHunt.java`,
+`SpawnFrame.java`, `SpawnName.java`, `GlobalWriter.java`,
+`WorldName.java`, `EntityInsert.java`; reports `local/reg_afe0.txt`,
+`local/spawn_hunt.txt`, `local/spawn_frame.txt`,
+`local/spawn_name.txt`, `local/global_writer.txt`,
+`local/world_name.txt`, `local/entity_insert.txt`). No re-analysis,
+no symbol scan, no inject, no launch, nothing written under `M:\`.
+No new probe mode. The call below is not complete, so nothing was
+emitted.
+
+The function is 1185 bytes. Its three arguments are the child
+entity, the new parent entity, and a flag, not a scene record:
+
+```
+RVA 0x94AFEA MOV R15, [RCX + 0x80] ; old parent, saved
+RVA 0x94AFF1 MOV RBX, RCX ; child
+RVA 0x94AFFB MOV EBP, R8D ; flag
+RVA 0x94AFFE MOV RDI, RDX ; new parent
+```
+
+It takes the SRW lock at `0x148954BA8` (`0x94AFF4`). If
+`[child+0x80]` already equals the new parent it returns 0 at
+`0x94B039`. If the new parent is the child itself it prints
+`"You shouldn't parent entity to itself!"` (`LEA RCX, [0x1418AC010]`
+at `0x94B05F`) and writes `0xDEADCA7` to address 0 (`0x94B077`).
+
+When the child already has a parent, it unlinks the child from that
+parent's sibling list and clears the field:
+
+```
+RVA 0x94B0CC MOV [RCX + 0x90], RAX ; prev sibling skips the child
+RVA 0x94B0D5 MOV [RDX + 0x88], RAX ; or the parent head does
+RVA 0x94B0EF LEA RCX, [RDX + 0x220]
+RVA 0x94B100 CALL 0x140ad5f40 ; remove from the old parent's +0x220
+RVA 0x94B137 MOV [RBX + 0x80], RSI ; child+0x80 = 0
+RVA 0x94B13E MOV [RBX + 0x90], RSI ; child+0x90 = 0
+```
+
+`RSI` is 0 (`XOR ESI, ESI` at `0x94B098`). When the new parent is
+non-null it links the other way. The flag only changes the third
+argument of the insert and one bit at `child+0x98`; the factory's
+`0` takes the first arm:
+
+```
+RVA 0x94B169 TEST EBP, EBP
+RVA 0x94B16B JZ 0x14094b195
+RVA 0x94B195 LEA RCX, [RDI + 0x220] ; parent+0x220
+RVA 0x94B19C XOR R9D, R9D
+RVA 0x94B19F MOV R8, RBX ; the child
+RVA 0x94B1A5 CALL 0x140ad5480
+RVA 0x94B1B0 CALL 0x14092fce0
+RVA 0x94B1B5 MOV [RBX + 0x80], RDI ; child+0x80 = parent
+RVA 0x94B1C3 MOV [RBX + 0x90], RAX ; child+0x90 = old head
+RVA 0x94B1CA MOV [RDI + 0x88], RBX ; parent+0x88 = child
+```
+
+`entity+0xC8` is only tested (`CMP [RBX+0xC8], RSI` at `0x94B145`
+and `0x94B1D1`). It is never stored, so the model pointer is not
+written here. After the lock is released, a non-zero old parent is
+handed to `FUN_140ad7130` through `[EntityManagerGame*+0x1F00]`
+(`MOV RCX, [0x148982C40]` at `0x94B252`, `MOV RCX, [RCX+0x1F00]` at
+`0x94B25C`). Bit 27 of `[child+0x98]` posts `MsgChildEntityRemoved`
+on the old parent and `MsgChildEntityAdded` on the new one. The
+return is 1.
+
+So the factory's fifth call sets the new entity's parent pointer and
+splices it into that parent's child list. It does not insert the
+entity into a world list and it does not load a model. Calling it
+with a stack record as the parent parents the fresh entity to a
+temporary. That is not a body.
+
+Callers of `FUN_14094afe0` itself, every code ref, not only the
+first 15:
+
+| ref | RVA | what RCX is |
+|---|---|---|
+| `.pdata` | `0x8BFA7A4` | not code |
+| data | `0x1BD00E8` | not a vtable; the qword is `0x94B0900094AFE0`, two packed RVAs |
+| data | `0x1BD011C` | same packed-RVA word |
+| call | `0x94B4AA` | `FUN_14094b490`, `MOV RBX, RCX` at `0x94B4A7`: the child entity, and `RDX` is its current `[child+0x80]` |
+| thunk | `0x956246` | the eight-byte `Parent` row stub: `MOV RDX, [RDX]` / `XOR R8D, R8D` / `JMP 0x14094afe0`. Its one reference is the type-record row at `0x1E61C28` |
+
+None of those is inside `FUN_1401f82b0` or `FUN_1401f7bd0`. The JSON
+path reaches this function only through the `Parent` row thunk, which
+has no code caller of its own. The one real call, `FUN_14094b490`,
+re-parents the child onto the parent it already has and then posts
+`MsgParentChanged` (`LEA RAX, [0x1418B1AA8]` at `0x94B4DE`). It does
+not take a scene. Its own callers (`FUN_140902670` at `0x902978`,
+`FUN_140948e40` at `0x948E7C` and `0x948E98`, `FUN_140955660` at
+`0x9556BF`, `FUN_140961930` at `0x961949`, `FUN_140988ad0` at
+`0x9894A5`, `FUN_140993c50` at `0x993C5C`) pass the child entity in
+`RCX` and its current parent in `RDX`. `FUN_140948e40` is a
+destructor: it zeroes `RDX` and `R8` before the call at `0x948E78`,
+so that one unparents.
+
+The global `FUN_14094afe0` reads, `0x148982C40` (RVA `0x8982C40`), is
+`EntityManagerGame*`. The store is `MOV [0x148982C40], RBX` at
+`0xD5E79A` inside `FUN_140d5e2c0`, and the vtable written onto that
+object one instruction earlier is `LEA RAX, [0x1418FB560]` at
+`0xD5E78B`. The Complete Object Locator at that vtable minus 8
+(`0x141A85628`) names `.?AVEntityManagerGame@@`. A second store,
+`MOV [0x148982C40], R13` at `0xD607BE` in `FUN_140d60010`, is the
+matching clear. The first six vtable slots (`FUN_140900b10`,
+`FUN_14004fae0`, `FUN_140d5b880`, `FUN_140d5b960`, `FUN_140d5b8f0`,
+`FUN_140d5c110`) do not call `FUN_14094afe0`, `FUN_14094b490` or
+`FUN_140902670`. The object is live, and this function only uses it
+to notify a parent change.
+
+Spawn strings, one `findBytes` pass, not a symbol walk. `SpawnEntity`,
+`PlaceEntity`: zero hits. `CreateEntity` (RVA `0x18B01C0`) is
+referenced from `FUN_140990b90`, `CreateEntityForSequenceVariable`
+(`0x18E0DA0`) from `FUN_140b9fe80`, `CreateEntityFromSpawnSetup`
+(`0x19A2DAB`) from `FUN_1414d3520`. None of those three functions
+loads `GameModule` (`0x8983150`), `CameraPredictionManager`
+(`0x8982CB0`), `PlayerManager` (`0x8982C80`), `SceneManagerGame`
+(`0x8982DD0`) or `EntityManagerGame` (`0x8982C40`). They are script
+export registrars. `EntitySpawn`, `EntitySpawnProgram`,
+`EntitySpawnOverrideProgram` and `EntitySpawnSetup` have no code ref.
+The `ControlledEntity` type record at `0x21DA6C0` is compared as a
+word (`SUB AX, word ptr [0x1421DA6C0]`) by type-check functions; the
+first twenty such refs are all that shape, and the pointer value
+`0x1421DA6C0` itself is stored at exactly two data sites (`0x1EC45D0`,
+`0x21DB6E0`), neither inside a function. No function takes that type
+record and an `EntityManagerGame*` together.
+
+Miss. There is no runtime register call whose arguments are a global
+we already hold and the fresh entity. `FUN_140902220` is the nearest
+shape (`MOV RDX, RSI` / `MOV RCX, RDI` / `CALL 0x140902670` at
+`0x902556`), and `FUN_140902670` does load `EntityManagerGame*`
+(`CMP [0x148982C40], 0` at `0x90297D`), but the call unparents every
+child of the entity in `RDX`. It is a teardown, not an insert.
+Decompiled or disassembled this pass: `FUN_14094afe0`,
+`FUN_14094b490`, `FUN_140902670` (the window at `0x902920`),
+`FUN_140902220` (entry and the call at `0x90255C`), `FUN_140900380`
+(the `EntityManagerGame` constructor, first 40 instructions),
+`FUN_140948e40`, and the six vtable slots above. The single next
+decompile is `FUN_140ad5480`, the insert into `[parent+0x220]` at
+`0x94B1A5`: name that list, and whether it is the scene's entity
+array or only the parent's children. No call until that is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 Selftest is 46/46 on the offline exe. The six new anchors are the
 walker's call (`FF 50 08` at `0x931073`), the count load and its
 `JS` (`8B 93 F0 00 00 00 83 EA 01 78` at `0x91510A`), the constructor's
