@@ -1,11 +1,13 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5 milestone 1 corrected** (2026-10-21) — the walk run
-showed the world position is the double3 at `entity+0xD8`, not the Mat34.
-The probe now reads that double3. A setter that takes the
-`entity+0x298` lock was not found; the functions that do write those
-qwords are the constructor and a struct clone. Route **(c)** is still
-blocked on a write of that double3. Claim issue:
+Status: **phase 5, spawn call stays blocked** (2026-10-21) — the BSS
+qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
+RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
+stores a `NetErrorHandlerGame*` built at startup, and `+0xF8` on that
+object is a `StateInGame*` whose `+0x108` is zeroed in the same
+constructor. A second `PlayerGame` still needs
+`[[0x148983150]+0x50]+0x20`, which the probe thread does not have.
+`--spawn-once` does not call `FUN_14134c950`. Claim issue:
 cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 ## Game identity (observed, verified this session)
@@ -941,12 +943,11 @@ First pointer the spawn function dereferences:
 `0x134C9B1` is `48 8B 05 38 B8 60 07`. RIP+disp lands on VA
 `0x1489581F0` (RVA `0x89581F0`). That qword is past the file-backed
 `.data` (virtual size `0x6EECA90`, raw size `0x626800`), so the loader
-zeroes it. The only write xref is `FUN_140d2fca0` at `0xD304B9`
-(`MOV [0x1489581F0], RDI`), inside the startup chain, not a value the
-probe can pass in a register. `FUN_14134c590` never mentions this
-global. The later load at `0x134C9D5` of `[0x148983150]` is the same
-class (a BSS pointer the caller does not pass) and is also unchecked
-at `0x134C9FA` (`MOV RCX, [RAX+0x50]`).
+zeroes it. The write was then checked against the exe bytes, not
+against Ghidra's xref (next section). The later load at `0x134C9D5`
+of `[0x148983150]` is the same class (a BSS pointer the caller does
+not pass) and is also unchecked at `0x134C9FA`
+(`MOV RCX, [RAX+0x50]`).
 
 Decision: **removed the call.** It is not one pointer the probe can
 read offline and pass. `--spawn-once` still injects, but the thread
@@ -963,19 +964,115 @@ Selftest after the rebuild (offline exe, no inject, no launch):
 20/20, `SELFTEST OK`. New anchors: the reload at `0x134C9B1`
 (`48 8B 05 38 B8 60 07`) and `MOV RCX,[RAX+0xF8]` at `0x134C9BA`.
 
+### Who writes `0x1489581F0` (2026-10-21, exe bytes, no inject)
+
+Checked the offline exe
+(`local/workspace/hfw-binaries/HorizonForbiddenWest.exe`, SHA-256
+unchanged) with capstone 5.0.7. No Ghidra re-analysis. No inject, no
+launch, nothing written under `M:\`. `--spawn-once` is still the
+blocked path from `05ab3b2`; the call was not put back.
+
+The store is a real write. File bytes at RVA `0xD304B9` are
+`48 89 3D 30 7D C2 07`. That is `MOV [RIP+0x7C27D30], RDI`. The next
+instruction begins at `0xD304C0`, and
+`0xD304C0 + 0x7C27D30 = 0x89581F0`, which is VA `0x1489581F0`. A scan
+of every executable section for `REX.W` + `MOV r/m64, r64` (`89 /r`),
+`MOV r/m64, imm32` (`C7 /0`), and `LEA r64, [RIP]` whose disp32 lands
+on that RVA found **one write and zero LEAs**:
+
+```
+RVA 0xD304B9  48 89 3D 30 7D C2 07   MOV [0x1489581F0], RDI
+```
+
+194 other `REX.W MOV r64, [RIP]` sites read it (`8B /r`), including
+the two loads inside `FUN_14134c950` (`0x134C979`, `0x134C9B1`). No
+32-bit form and no locked RMW hits the qword. Nothing else stores it,
+so nothing fills it later when a save loads.
+
+What gets stored. Inside `FUN_140d2fca0` (`0xD2FCA0`), `R12` is
+zeroed at `0xD2FF78` (`XOR R12D, R12D`) and is not written again
+before the store. The size comes from a Decima type record; if it is
+0, `RDI` is set from `R12` at `0xD304AB` (`MOV RDI, R12`). Otherwise
+`FUN_1401e6100` returns the block into `RDI` (`0xD304A6`). Either way
+the global receives that pointer, then `FUN_140d3d960(RDI)` runs at
+`0xD304C0`. The only direct caller of `FUN_140d2fca0` is `0x429D4`,
+and the only caller of that is the startup chain (`MainProg` →
+`GameMainProg`). The incoming `RCX` is saved at `[RSP+8]` and never
+reloaded. `FUN_140231060` returns `AL=1` at `0x231544` on the success
+path and `AL=0` at `0x23154D`; `FUN_140d2fca0` returns immediately
+when `AL` is 0 (`0xD2FCC0`), so the store only happens when startup
+gets past that gate.
+
+The object is not `NetSessionManagerNoOp`. `FUN_140d3d960` writes
+`NetErrorHandlerGame::vftable` (RVA `0x18FB208`, COL at `0x1A83B18`,
+type descriptor `.?AVNetErrorHandlerGame@@`) at `[this]` and a second
+`NetErrorHandlerGame` vtable (`0x18FC2A0`) at `[this+8]`. It then
+fills slots on that object, including `+0xF8`. The `+0xF8` store is
+`MOV [RDI+0xF8], RSI` at `0xD3E8D7`, after `FUN_140d966f0(RSI, ...)`
+at `0xD3E8CF`. That constructor writes `StateInGame::vftable` (RVA
+`0x18FFD88`, `.?AVStateInGame@@`) at `[this]` and zeroes
+`[this+0x108]` at `0xD967CD` (`MOV [RCX+0x108], RSI` with `ESI==0`).
+So once startup has returned, `[0x1489581F0]` is a
+`NetErrorHandlerGame*`, `[that+0xF8]` is a `StateInGame*`, and
+`[StateInGame+0x108]` is still 0. `NetSessionManagerNoOp::vftable`
+(`0x184AEE0`) is not written onto either object.
+
+The null the probe saw is not a second address. `0x134C9B1` is
+`48 8B 05 38 B8 60 07`; `0x134C9B1+7+0x0760B838 = 0x1489581F0`, the
+same RVA the startup store writes. Image base `0x140000000` makes the
+VA identical. A loaded save does not have another writer. If the live
+qword was 0 while the session was in game, startup did not publish
+it (the `AL==0` early return, or the size-0 path that stores `R12`).
+That was not re-read from the process this session.
+
+`FUN_14134c950` is still not callable from the probe thread. The
+reload at `0x134C9B1` has no null test, and the next load is a
+different global: `MOV RAX, [0x148983150]` at `0x134C9D5`, then
+`MOV RCX, [RAX+0x50]` at `0x134C9FA` with no test. `R15` (the pointer
+passed to `FUN_140d73270` as `RDX` at `0x134CA87`) is
+`[[0x148983150]+0x50]+0x20`, taken at `0x134C9FE`. Three `REX.W`
+stores hit `0x148983150`:
+
+- `0xD5E0C6` `MOV [0x148983150], RBP` with `EBP==0` (clears it),
+- `0xD5E768` `MOV [0x148983150], RDI` (publishes it), in a function
+ that writes `PlayerManagerGame::vftable` (`0x18FBE60`,
+ `.?AVPlayerManagerGame@@`) at `0xD5E646` and `GameModuleState`
+ (`0x18FB998`) at `0xD5E6B0`,
+- `0xD61673` `MOV [0x148983150], R12` (clears it again).
+
+The entity pointer is therefore a field of whatever `0xD5E768`
+published, not an argument of the spawn call. Building a
+`PlayerGame` without `FUN_14134c950` does not remove the dependency.
+`FUN_140d73270(this, entity)` forwards `RDX` into `FUN_140913be0`,
+which stores it at `[this+0x30]` (`MOV [RDI+0x30], RBX` at
+`0x913CB7`). Direct calls of `FUN_140d73270` are only `0x134CA90`,
+`0x134CAA8` (both inside `FUN_14134c950`, `RDX = R15`) and
+`0x13D8540`. The third one is the same shape: `MOV RAX, [0x148983150]`
+at `0x13D847F`, then `MOV RDX, RSI` / `CALL 0x140d73270`. There is no
+direct `CALL` of `FUN_140d8c2d0`; the insert stays the virtual at
+`[PlayerManagerGame::vftable+8]`.
+
+Conclusion: **(c)**. Neither path is callable from an injected thread.
+The missing pointer is `[[0x148983150]+0x50]+0x20`, the entity passed
+as `RDX` to `FUN_140d73270`. `0x148983150` itself is only published at
+`0xD5E768` and is cleared at `0xD5E0C6` and `0xD61673`. `+0x50` on
+that object was not found as a store in the publish function, so the
+entity pointer is not named beyond that load. Do not re-enable
+`FUN_14134c950`. Do not emit `FUN_140d8c2d0`.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2: a second entity. One live call of `FUN_14134c950` from
- the injected thread faulted (`0xC0000005`) with `count` still 1.
- The fault is `MOV RCX,[RAX+0xF8]` at RVA `0x134C9BA` after
- `MOV RAX,[0x1489581F0]` with no null test. That global is BSS,
- written only by `FUN_140d2fca0`, and the caller does not pass it.
- `--spawn-once` no longer calls the function. Do not write the
- double3. Do not call `FUN_14101bd70`. The next step is a game-thread
- call of `FUN_14134c950` (Present/job hook), not another inject-thread
- call and not a store of a guessed pointer.
+- Milestone 2, revised: do not call `FUN_14134c950` from any thread.
+ The entity argument of `FUN_140d73270` is
+ `[[0x148983150]+0x50]+0x20`, and `+0x50` of the object published at
+ `0xD5E768` has no store in that function. Next milestone is to name
+ the instruction that writes that `+0x50` field (function, RVA, when
+ it runs). Only after that field is a known live object is an insert
+ of a `PlayerGame` worth writing, and it is still not this session.
+ Do not write the double3. Do not call `FUN_14101bd70`. Do not store
+ to `entity+0xD8`.
 
 ## Sources
 
