@@ -780,19 +780,87 @@ net layer. It is a virtual on a vtable, which is why it has no direct
 Calling it from an injected thread is the next step, and it was not
 called here.
 
+### Spawn call convention (2026-10-21, Ghidra `-noanalysis`)
+
+`FUN_14134c950` was re-read before anything called it. Prologue at
+RVA `0x134C950`:
+
+```
+48 89 5C 24 10 MOV [RSP+0x10], RBX
+48 89 74 24 18 MOV [RSP+0x18], RSI
+48 89 7C 24 20 MOV [RSP+0x20], RDI
+48 89 4C 24 08 MOV [RSP+8], RCX
+```
+
+The saved RCX is the home slot at `[RBP+0x67]`. At `0x134CB4A` that
+slot is zeroed (`MOV [RBP+0x67], RDI`, RDI is 0) and then passed to
+`FUN_140108010` as the destination of the `"player"` name. The incoming
+argument is discarded. The only caller confirms it: `FUN_14134c590` at
+`0x134C657` is `E8 F4 02 00 00` with no `MOV RCX` between it and the
+previous call. So the call is `void FUN_14134c950(void)`.
+
+It does not return a value the caller uses. `FUN_14134c590` ignores
+RAX and goes on to walk `[pm+0x10]`.
+
+Allocation size is not an argument. Byte at RVA `0x2161594` is the
+type tag `0x04`, and the size switch (`0x134CA52`, table at
+`0x134CF84`, case 4 falls through) uses the qword loaded at
+`0x134C9EB` from RVA `0x21615A0`. Those bytes are `10 02 00 00`, so
+`FUN_1401e6100` is called with `0x210`. That record is static data in
+the image, read by twenty other functions; it is not something the
+probe builds.
+
+Thread context. `FUN_14134c950` itself has no `GS:` operand (408
+instructions, zero hits). Three callees do, all the same shape:
+
+- `FUN_1401e6100` at `0x1E610A`: `MOV RAX, GS:[0x58]`, then
+ `[tls+0x1858]`. If that byte is 0 it calls `FUN_14165833c`
+ (`__dyn_tls_on_demand_init`, the same call `FUN_14134b340` makes).
+ Then `[tls+0x1A10]`; if that slot is 0 it stores the process-wide
+ pointer at `[0x14897A388]` and uses it.
+- `FUN_140108010` at `0x108094` and `FUN_140107920` at `0x107994`:
+ same `GS:[0x58]`, same `+0x1A10` slot, same fallback, and a
+ `CMOVZ` onto the static allocator at `0x141FE1F00` when the slot
+ already holds that address.
+
+An injected thread has an empty TEB slot, so those three sites take
+the fallback instead of a game-thread context. No lock is taken on
+entry. The critical section at `0x134CED1` is `TryEnter` on
+`[0x148982D88]+0x30` and `Enter` if that fails; it is the same lock
+the game thread takes, and this call runs while the sim is live, so
+the game can hitch for the call.
+
+What the call does after the alloc, which is why it is one shot and
+SEH-wrapped: `CoCreateGuid`, writes the GUID at `PlayerGame+8`, builds
+the name, then calls `PlayerGame` virtuals `+0x58`, `+0x20`, `+0x38`
+before the add slot at `0x134CF30`. Those virtuals run on the injected
+thread. SEH catches an access violation; it does not catch a stall
+inside one of them.
+
+### Probe one-shot (2026-10-21)
+
+`--spawn-once` is opt-in. The default is still the 45 s read-only
+sampler. The loader writes one byte to `hfw_probe.dll.mode` beside the
+DLL (not in the game directory). The DLL reads that byte from its own
+module path and, only when it is 1, starts `spawn_once` instead of the
+sampler. That thread waits until `[pm+0x08] >= 1` (60 s timeout), logs
+`spawn-once before count=N`, calls `FUN_14134c950` once inside
+`__try`, logs `spawn-once after count=N list=...`, and exits. It does
+not store the double3 and does not call `FUN_14101bd70`.
+
+A second body is the milestone after a log that shows `count=1` then
+`count=2`. Driving that body's double3 from a received pose is the
+step after that, and it is still not the owner's entity.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2: a second entity. The insert is found (see "Who
- inserts into the player list" above): `FUN_14134c950` builds a
- `PlayerGame` with `FUN_140d73270` and calls
- `PlayerManagerGame::vftable+8` (`FUN_140d8c2d0`), which pushes it
- into `pm+0x08` through `FUN_1402250c0`. Next is to call that path
- once, from the probe, and confirm `[pm+8]` goes from 1 to 2. Do not
- write the double3 until that second entry is observed. Do not call
- `FUN_14101bd70`; it takes `entity+0x298`, which the sim thread also
- takes.
+- Milestone 2: a second entity. The call is in the probe as
+ `--spawn-once` (see "Spawn call convention" above). It has not been
+ run against a live game. Do not write the double3 until a log shows
+ `[pm+8]` going from 1 to 2. Do not call `FUN_14101bd70`; it takes
+ `entity+0x298`, which the sim thread also takes.
 
 ## Sources
 

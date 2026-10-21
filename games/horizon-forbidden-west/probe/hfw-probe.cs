@@ -1,8 +1,14 @@
-// hfw-probe — phase 5 milestone 1.
+// hfw-probe — phase 5.
 //
-// Read-only injected module. The DLL samples at 10 Hz from its own thread.
-// It never writes game memory, never hooks Present, and never calls a game
-// function. The loader does not attach a console to the game process.
+// Default: read-only injected sampler. The DLL samples at 10 Hz from its
+// own thread. It never writes game memory, never hooks Present, and never
+// calls a game function.
+//
+// --spawn-once: the DLL waits until the player-list count is at least 1,
+// calls FUN_14134c950 once, logs the count again, and exits. It does not
+// write the entity double3. The loader writes one byte next to the DLL
+// (hfw_probe.dll.mode, not the game directory). The DLL reads that byte
+// from its own module path. Default stays the 45 s sampler.
 //
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
@@ -68,6 +74,7 @@ internal static class Program
 
  var exe = Arg(args, "--exe") ?? DefaultExe();
  var seconds = int.TryParse(Arg(args, "--seconds"), out var s) ? s : 45;
+ var spawnOnce = HasFlag(args, "--spawn-once");
 
  if (!Guard(exe, out var why))
  {
@@ -91,8 +98,9 @@ internal static class Program
 
  // Strikers' shape: VirtualAllocEx + WriteProcessMemory + CreateRemoteThread,
  // here pointed at LoadLibraryW so hfw_probe.dll runs inside the game.
- // The DLL only reads. The loader never writes game memory.
- var injected = Inject(proc.Id, Path.GetFullPath(dll), out var whyNot);
+ // The default DLL only reads. --spawn-once calls FUN_14134c950 once.
+ // The mode byte sits next to the DLL, which the game never writes.
+ var injected = Inject(proc.Id, Path.GetFullPath(dll), spawnOnce, out var whyNot);
  if (!injected)
  {
  Note("REFUSED: inject failed: " + whyNot);
@@ -102,6 +110,13 @@ internal static class Program
  // HFW pauses when it loses foreground. This process must not become it.
  // ASFW_ANY lets the game call SetForegroundWindow and take focus back.
  AllowSetForegroundWindow(AsfwAny);
+ if (spawnOnce)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=spawn-once. " +
+ "one call of FUN_14134c950. log is hfw-probe.log in the game's working directory. " +
+ "load a save first. alt-f4 if the game stays wedged.");
+ return 0;
+ }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
  "log is hfw-probe.log in the game's working directory. " +
  $"waiting {seconds}s; the dll thread stops on its own.");
@@ -132,7 +147,7 @@ internal static class Program
  private const uint MemCommitReserve = 0x3000;
  private const uint PageReadWrite = 0x04;
 
- internal static bool Inject(int pid, string dllPath, out string why)
+ internal static bool Inject(int pid, string dllPath, bool spawnOnce, out string why)
  {
  why = "";
  var access = ProcessCreateThread | ProcessQueryInformation | ProcessVmOperation
@@ -146,6 +161,10 @@ internal static class Program
 
  try
  {
+ // One byte in front of the wide path. The DLL reads it back from its
+ // own file (the loader's copy, not the game directory) to decide
+ // which thread to start. The remote thread is still LoadLibraryW.
+ File.WriteAllBytes(dllPath + ".mode", new[] { spawnOnce ? (byte)1 : (byte)0 });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
  if (remote == 0)
@@ -183,7 +202,6 @@ internal static class Program
  CloseHandle(handle);
  }
  }
-
  private static string DeadReadPath(nint handle, Process proc, int seconds, string logPath)
  {
  return "";
@@ -299,6 +317,13 @@ internal static class Program
  // that pushes into pm+8: LEA RCX,[RSI+8]; MOV [RSP+0x78],RBX;
  // LOCK INC [RBX+0x18]; LEA RDX,[RSP+0x78]; CALL FUN_1402250c0.
  ("player-list insert pm+8", 0xD8C381, "48 8D 4E 08 48 89 5C 24 78 F0 FF 43 18 48 8D 54 24 78 E8 28 8D 49 FF"),
+ // FUN_14134c950 prologue: MOV [RSP+0x10],RBX / MOV [RSP+0x18],RSI /
+ // MOV [RSP+0x20],RDI / MOV [RSP+8],RCX. The call site in
+ // FUN_14134c590 is a bare E8 with no register setup.
+ ("spawn FUN_14134c950", 0x134C950, "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 48"),
+ ("spawn call site", 0x134C657, "E8 F4 02 00 00"),
+ // size dword the spawn function passes to FUN_1401e6100 (0x210).
+ ("spawn alloc size", 0x21615A0, "10 02 00 00"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  };
@@ -355,6 +380,13 @@ internal static class Program
  for (var i = 0; i < args.Length - 1; i++)
  if (args[i] == name) return args[i + 1];
  return null;
+ }
+
+ private static bool HasFlag(string[] args, string name)
+ {
+ foreach (var a in args)
+ if (a == name) return true;
+ return false;
  }
 
  private static ulong ReadU64(nint h, ulong addr)
