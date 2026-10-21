@@ -14,6 +14,13 @@
  * does not pass it in a register. This mode logs the block and exits.
  * It does not store the entity double3 and does not call FUN_14101bd70.
  *
+ * --read-slot (opt-in, mode byte 2): also read-only. Waits until the
+ * GameModule* at RVA 0x8983150 (VA 0x148983150) is non-null, then
+ * samples for 20 s at 2 Hz. Each sample is one line:
+ * slot module=0x.. plus50=0x.. entity=0x..
+ * plus50 is [module+0x50]. entity is [[module+0x50]+0x20] when plus50
+ * is non-null, else 0. No game function is called. Nothing is written.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -46,7 +53,9 @@
 
 #define RVA_PLAYER_MANAGER 0x8982C80ull
 #define RVA_SCENE_MANAGER 0x8982DD0ull
-#define RVA_SPAWN 0x134C950ull
+#define RVA_GAME_MODULE 0x8983150ull
+#define OFF_MODULE_SLOT 0x50
+#define OFF_SLOT_ENTITY 0x20
 #define OFF_LIST_COUNT 0x08
 #define OFF_LIST_STORAGE 0x10
 #define OFF_PLAYER_ENTITY 0x48
@@ -58,6 +67,10 @@
 #define SAMPLE_MS (1000 / SAMPLE_HZ)
 #define SAMPLE_COUNT 450 /* 45 s at 10 Hz */
 #define WAIT_TICKS 600 /* 60 s at 10 Hz for a save to load */
+#define SLOT_HZ 2
+#define SLOT_MS (1000 / SLOT_HZ)
+#define SLOT_SAMPLES 40 /* 20 s at 2 Hz */
+#define SLOT_WAIT_TICKS 120 /* 60 s at 2 Hz for the GameModule global */
 
 /* FUN_14134c950 is not called. First unchecked deref is
  * RVA 0x134C9BA: MOV RCX, [RAX+0xF8] where RAX came from
@@ -126,7 +139,8 @@ static DWORD WINAPI spawn_once(LPVOID unused)
  return 0;
 }
 
-static int spawn_wanted(HINSTANCE inst)
+/* 0 = default sampler, 1 = spawn-once (blocked), 2 = read-slot. */
+static int mode_byte(HINSTANCE inst)
 {
  wchar_t path[MAX_PATH];
  HANDLE f;
@@ -140,7 +154,73 @@ static int spawn_wanted(HINSTANCE inst)
  if (f == INVALID_HANDLE_VALUE) return 0;
  ReadFile(f, &b, 1, &got, NULL);
  CloseHandle(f);
- return got == 1 && b == 1;
+ if (got != 1) return 0;
+ return (unsigned char)b;
+}
+
+/* Wait until [0x148983150] is non-null, then log module / +0x50 /
+ * [[+0x50]+0x20] for 20 s. Reads only. No game call. */
+static DWORD WINAPI read_slot(LPVOID unused)
+{
+ FILE *fp;
+ int i;
+ int waited = 0;
+ unsigned long long module = 0;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IOFBF, 8192);
+
+ fprintf(fp,
+ "read-slot start hz=%d samples=%d gate=GameModule@0x8983150 "
+ "read-only no-call\n",
+ SLOT_HZ, SLOT_SAMPLES);
+
+ while (!g_stop && waited < SLOT_WAIT_TICKS) {
+ module = rd64(exe_base() + RVA_GAME_MODULE);
+ if (module) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+ if (!module) {
+ fprintf(fp,
+ "read-slot timeout gate=GameModule@0x8983150 waited_s=%d "
+ "module=0x0 plus50=0x0 entity=0x0 faults=%ld\n",
+ waited / SLOT_HZ, g_faults);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ for (i = 0; i < SLOT_SAMPLES && !g_stop; i++) {
+ unsigned long long base = exe_base();
+ unsigned long long plus50 = 0;
+ unsigned long long entity = 0;
+ LONG faults_before = g_faults;
+ module = rd64(base + RVA_GAME_MODULE);
+ if (module)
+ plus50 = rd64(module + OFF_MODULE_SLOT);
+ if (plus50)
+ entity = rd64(plus50 + OFF_SLOT_ENTITY);
+ if (g_faults != faults_before) {
+ fprintf(fp,
+ "slot fault sample=%d module=0x%llX plus50=0x%llX entity=0x%llX\n",
+ i, module, plus50, entity);
+ } else {
+ fprintf(fp,
+ "slot module=0x%llX plus50=0x%llX entity=0x%llX\n",
+ module, plus50, entity);
+ }
+ fflush(fp);
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp, "read-slot stop samples=%d faults=%ld\n", i, g_faults);
+ fflush(fp);
+ fclose(fp);
+ return 0;
 }
 
 static DWORD WINAPI logger(LPVOID unused)
@@ -225,9 +305,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  HANDLE thread;
  (void)reserved;
  if (reason == DLL_PROCESS_ATTACH) {
+ int mode = mode_byte(inst);
+ LPTHREAD_START_ROUTINE entry = logger;
  DisableThreadLibraryCalls(inst);
- thread = CreateThread(NULL, 0,
- spawn_wanted(inst) ? spawn_once : logger, NULL, 0, NULL);
+ if (mode == 1) entry = spawn_once;
+ else if (mode == 2) entry = read_slot;
+ thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {
  InterlockedExchange(&g_stop, 1);

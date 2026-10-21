@@ -13,6 +13,14 @@
 // DLL reads that byte from its own module path. Default stays the
 // 45 s sampler.
 //
+// --read-slot: opt-in. Mode byte 2. The DLL waits until the GameModule*
+// at RVA 0x8983150 is non-null, then for 20 s at 2 Hz logs
+// slot module=0x.. plus50=0x.. entity=0x..
+// plus50 is [module+0x50]. entity is [[module+0x50]+0x20] only when
+// plus50 is non-null. It calls no game function and writes nothing.
+// A line with plus50 non-null is the slot being live. --spawn-once
+// stays the blocked log.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -98,7 +106,14 @@ internal static class Program
  }
 
  var spawnOnce = HasFlag(args, "--spawn-once");
+ var readSlot = HasFlag(args, "--read-slot");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
+ Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
+ if (spawnOnce && readSlot)
+ {
+ Note("REFUSED: --spawn-once and --read-slot are mutually exclusive.");
+ return 2;
+ }
 
  var exe = Arg(args, "--exe") ?? DefaultExe();
  var seconds = int.TryParse(Arg(args, "--seconds"), out var s) ? s : 45;
@@ -131,16 +146,19 @@ internal static class Program
  // Strikers' shape: VirtualAllocEx + WriteProcessMemory + CreateRemoteThread,
  // here pointed at LoadLibraryW so hfw_probe.dll runs inside the game.
  // The default DLL only reads. --spawn-once injects a DLL that logs
- // the block and does not call FUN_14134c950. The mode byte sits next
- // to the DLL, which the game never writes.
- var injected = Inject(proc.Id, Path.GetFullPath(dll), spawnOnce, out var whyNot);
+ // the block and does not call FUN_14134c950. --read-slot injects a
+ // DLL that only reads [GameModule+0x50]. The mode byte sits next
+ // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
+ // 2 read-slot.
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : 0);
+ var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
  Note("inject fail " + whyNot);
  Note("REFUSED: inject failed: " + whyNot);
  return 4;
  }
- Note(spawnOnce ? "injected mode=spawn-once" : "injected mode=sample");
+ Note(mode == 1 ? "injected mode=spawn-once" : mode == 2 ? "injected mode=read-slot" : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
  // ASFW_ANY lets the game call SetForegroundWindow and take focus back.
@@ -150,6 +168,14 @@ internal static class Program
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=spawn-once. " +
  "FUN_14134c950 is not called. log is hfw-probe.log in the game's working directory. " +
  "expect a line starting with 'spawn-once blocked'. do not expect count=2.");
+ return 0;
+ }
+ if (readSlot)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=read-slot. " +
+ "no game call, no write. log is hfw-probe.log in the game's working directory. " +
+ "a live slot is a line 'slot module=0x.. plus50=0x.. entity=0x..' with plus50 not 0. " +
+ "samples 20s at 2 Hz after GameModule@0x8983150 is non-null.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -199,7 +225,7 @@ internal static class Program
  private const uint MemCommitReserve = 0x3000;
  private const uint PageReadWrite = 0x04;
 
- internal static bool Inject(int pid, string dllPath, bool spawnOnce, out string why)
+ internal static bool Inject(int pid, string dllPath, int mode, out string why)
  {
  why = "";
  var access = ProcessCreateThread | ProcessQueryInformation | ProcessVmOperation
@@ -216,7 +242,8 @@ internal static class Program
  // One byte in front of the wide path. The DLL reads it back from its
  // own file (the loader's copy, not the game directory) to decide
  // which thread to start. The remote thread is still LoadLibraryW.
- File.WriteAllBytes(dllPath + ".mode", new[] { spawnOnce ? (byte)1 : (byte)0 });
+ // 0 sampler, 1 spawn-once (blocked), 2 read-slot.
+ File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
  if (remote == 0)

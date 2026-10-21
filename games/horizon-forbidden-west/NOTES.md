@@ -1151,16 +1151,54 @@ not have `+0x50` filled by `FUN_140d5e2c0`.
 wants is still one field further, `[that+0x20]`, which `FUN_14134c950`
 loads at `0x134C9FE`. This session did not read it from a live process.
 
+### `--read-slot` (2026-10-21, built, not injected)
+
+Opt-in flag on the same loader. Default sampler is unchanged (mode
+byte 0, 10 Hz, 45 s). `--spawn-once` is unchanged (mode byte 1): it
+still logs the block and does not call `FUN_14134c950`. `--read-slot`
+writes mode byte 2 beside the DLL, not under `M:\`.
+
+Gate: the `GameModule*` at RVA `0x8983150` (VA `0x148983150`) becoming
+non-null. `NOTES` does not treat `[PlayerManagerGame+0x08] >= 1` as
+"a save is loaded" for this slot. That count is the player list. The
+`+0x50` store runs from `GameModuleStateLoading::vftable+0x30` after
+the publish, so the gate is the published pointer itself. The thread
+waits up to 60 s at 2 Hz for it, then samples 20 s at 2 Hz.
+
+Each sample is one `memcpy` per qword, inside SEH, and one log line:
+
+```
+slot module=0x.. plus50=0x.. entity=0x..
+```
+
+`plus50` is `[module+0x50]`. `entity` is `[[module+0x50]+0x20]` only
+when `plus50` is non-null, otherwise `0`. No game function is called.
+The double3 is not written.
+
+Success criterion: after a save is loaded, at least one of those lines
+has `plus50` non-null (`plus50=0x0` is the slot still empty). `entity`
+non-null on the same line is the pointer `PlayerGame`'s constructor
+wants; it is recorded, not used.
+
+The loader returns as soon as `LoadLibraryW` returns. The shell does
+not wait the 20 s. The lines land in `hfw-probe.log` in the game's
+working directory. If that file is missing, the refusal is
+`hfw-probe-run.txt` beside the exe (`read-slot flag seen` or
+`read-slot flag absent`). This mode does not spawn and does not hitch:
+it only reads three qwords and sleeps 500 ms.
+
+Selftest already checks the store (`48 89 5F 50` at `0xD63090`) and
+the load (`48 8B 3D DA 00 C2 07` at `0xD6306F`). No new anchor. Not
+injected and not launched this pass.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised again: the `+0x50` store is named
- (`FUN_140d63060` at `0xD63090`, `48 89 5F 50`, during
- `GameModuleStateLoading`). Do not call `FUN_14134c950`. The next
- probe, still not a spawn, is to read `[[0x148983150]+0x50]` after a
- save has loaded and record whether it is non-null. The entity
- argument remains `[that+0x20]`. Do not write the double3. Do not
+- Milestone 2, revised again: `--read-slot` is the read. Success is
+ a log line `slot module=0x.. plus50=0x.. entity=0x..` with `plus50`
+ non-null after a save. The entity argument remains `[that+0x20]`.
+ Do not call `FUN_14134c950`. Do not write the double3. Do not
  call `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
  `FUN_140d8c2d0`.
 
