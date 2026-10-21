@@ -618,12 +618,55 @@ Functions read, and what each one actually writes:
  [RBP+0x298]`, a stack slot, and the `vmovsd [RBP+0xD8], xmm0` at
  `0xF549E7` writes a zeroed xmm. Not the entity lock.
 
-No function was found that stores `entity+0xD8/+0xE0/+0xE8` and takes
-the `entity+0x298` lock. The per-frame writer is not one of the
-functions above. A direct write of the three qwords is the remaining
-way to move a second instance; calling `FUN_140962590` or
-`FUN_140962640` from an injected thread would only read, and it would
-take a lock the game's own thread also takes.
+### Per-frame writer (2026-10-21, Ghidra `-noanalysis`)
+
+The literal `+0xD8` store grep hits unrelated objects. Starting from
+`FUN_140948a10` instead: it installs `Entity::vftable` at `+0x00`
+(VA `0x1418A9F40`), `+0x20` (`0x1418ACAA0`) and `+0x30` (`0x1418AD860`).
+None of those slots store the double3. The ten callers of the
+constructor are derived ctors (`CameraEntity`, `Sequence`,
+`GravityPocket`, `ControlledEntity`, `Humanoid`, `Explosion`,
+`BulletSystem`, `Throwable`, `InventoryWeapon`) and none of them
+reference the `PlayerManagerGame*` global.
+
+The integrator is not on the entity vtable. It is a component method
+that holds the entity at `this+0x48` and writes it under the entity's
+own lock:
+
+- `FUN_14101bd70` (RVA `0x101BD70`, 4709 bytes). `MOV R14, [RSI+0x48]`
+ at `0x101BE01` is the entity. `VMOVUPS XMM8, [R14+0xD8]` at `0x101BF50`
+ and `VMOVSD XMM0, [R14+0xE8]` at `0x101BF62` load the current double3.
+ A float3 at `[RAX+0x580]` is scaled by the constant xmmword at
+ `0x1419C38C0`, converted with `VCVTSS2SD`, and added
+ (`VADDSD XMM6, XMM0, XMM8` at `0x101C7F8`, then Y and Z). Under the
+ lock `LEA RBX, [R14+0x298]` / `TryEnter` / `Enter` at `0x101C822`, it
+ stores `VMOVSD [R14+0xD8], XMM6` at `0x101C83F`, `[R14+0xE0]` at
+ `0x101C848`, `[R14+0xE8]` at `0x101C851`, then `OR [R14+0x98], 1` and
+ `Leave`. The delta is that scaled float3, not a velocity field read
+ in this function. Sole caller: `FUN_141017470` at `0x101853B`, itself
+ called from `FUN_141016b00` at `0x1016CD6`.
+- `FUN_14103f2d0` (RVA `0x103F2D0`, 5469 bytes) is the same shape on a
+ sibling component. `MOV R15, [RDI+0x48]` at `0x103F34E`. The addend is
+ `[RDI+0x650]` scaled by the same constant, added at `0x103FFAE`, stored
+ under `LEA RBX, [R15+0x298]` at `0x103FFEA` / `+0xE0` / `+0xE8`. Sole
+ caller: `FUN_14103c000` at `0x103C696`, called from `FUN_14103b010`.
+
+`FUN_14101bd70` is the one whose object is this entity: same `+0x48`
+indirection the player chain uses, same `+0x298` critical section, and
+the Mat34 floats at `entity+0xFC/+0x100` are read in the same function.
+Both stores are conditional on a float compare against a threshold at
+`+0x5A0` / `+0x670`, so a frame where that compare fails does not write.
+
+### Spawn path
+
+No. None of the ten callers of `FUN_140948a10` reference
+`PlayerManagerGame*` (`0x8982C80`), and `FUN_141274ae0` is only called
+from `FUN_141274640` as a record clone. The functions that do reference
+the global (`FUN_140928430`, `FUN_140916bf0`, `FUN_140d34130`, and the
+other readers) only read the existing list. There is no call site that
+constructs a second object with this constructor and inserts it into
+the player list. A puppet that writes the one live entity moves the
+owner.
 
 ### Player slots
 
@@ -632,9 +675,9 @@ take a lock the game's own thread also takes.
 `FUN_140916bf0` calls to get the entity, indexes a second array at
 `param+0x10 + index*0x10` with a count at `param+0x08 + index*0x10`,
 and returns `player+0x48` only for the matching entry. So `pm+0x08` is
-a real count, not a hard-coded 1. Whether a second player object is
-ever constructed in single-player was not observed. A puppet that
-reuses the one live entity would move the owner's player.
+a real count, not a hard-coded 1. Single-player never constructs a
+second one (see spawn path above). A puppet that reuses the one live
+entity would move the owner's player.
 
 ### Probe retarget (2026-10-21)
 
@@ -659,6 +702,14 @@ dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
 14/14 PASS, SELFTEST OK
 ```
 
+The writer-store anchor added with the per-frame writer
+(`C4 C1 7B 11 B6 D8 00 00` at RVA `0x101C83F`) was checked the same way:
+
+```
+dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
+15/15 PASS, SELFTEST OK
+```
+
 The new anchors are the double3 loads inside `FUN_140962640`
 (`C5 F8 10 87 D8 00 00 00` at RVA `0x962681`, `C5 FB 10 8F E8 00 00 00`
 at `0x962689`) and the constructor's zeroing store at `0x948AEE`.
@@ -667,7 +718,12 @@ at `0x962689`) and the constructor's zeroing store at `0x948AEE`.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2: one puppet driven by our own transport, two instances.
+- Milestone 2: a second entity. There is no spawn path that constructs
+ one (`FUN_140948a10` callers never touch `PlayerManagerGame*`), so the
+ next step is to find who inserts into `pm+0x08` / `pm+0x10` and call
+ that with a second `Humanoid`. Until then, writing `FUN_14101bd70`'s
+ target moves the owner. Do not call the writer from an injected thread;
+ it takes `entity+0x298`, which the sim thread also takes.
 
 ## Sources
 

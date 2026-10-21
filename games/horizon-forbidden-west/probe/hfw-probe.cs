@@ -294,6 +294,7 @@ internal static class Program
  ("double3 load +0xD8", 0x962681, "C5 F8 10 87 D8 00 00 00"),
  ("double3 load +0xE8", 0x962689, "C5 FB 10 8F E8 00 00 00"),
  ("ctor zeroes +0xD8", 0x948AEE, "48 89 A9 D8 00 00 00"),
+ ("writer store +0xD8", 0x101C83F, "C4 C1 7B 11 B6 D8 00 00"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  };
