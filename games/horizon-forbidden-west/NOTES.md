@@ -297,9 +297,11 @@ Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
 | player list | `pm+0x08` count, `pm+0x10` ptr[] | `FUN_140d34130` walks exactly this |
 | local player | first entry, `[pm+0x10]` | `GetLocalPlayer` (`FUN_140928430`) copies that list out |
 | entity | `player+0x48` | `FUN_140916bf0`, the only caller of the local-player lookup |
-| position | `entity+0xD8`, 3 floats | `vmovups xmm6, [rbp+0xD8]` at RVA `0xD4F8D4` |
-| heading | `entity+0xE8`, float | `vmovsd xmm7, [rbp+0xE8]` at RVA `0xD4F8DC` |
-| world id | `[[scene+0x248]]`, uint32 | `FUN_140aa0d05` / `FUN_140aa13c1` read a resource id there |
+| position | `entity+0xF0`, Mat34, 0x3C bytes | `FUN_140962640` (`Entity_ExportedGetWorldTransform`), `vmovups ymm0, [rdi+0xF0]` at RVA `0x962697` |
+| translation | last row, floats at `+0x114/+0x118/+0x11C` | same copy; row-major 3x4 |
+| heading | row 2, floats at `+0x108/+0x10C/+0x110` | `FUN_140962440` transposes the same matrix |
+| rejected | `entity+0xD8`, three qwords | `FUN_140d4f750` copies them; the live log is not a position |
+| scene counter | `[[scene+0x248]]`, uint32 | `FUN_140aa0a00` reads it; it counted every frame |
 
 `GetLocalPlayer` is the script export `Player_sExportedGetLocalPlayer`
 (string RVA `0x18A9E08`); its function pointer is loaded at RVA `0x91357F`.
@@ -313,8 +315,9 @@ Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
  the chain, and writes `hfw-probe.log`. It never writes game memory, never
  hooks `Present`, and never calls a game function. Every pointer deref is
  one `memcpy` inside `__try`. A bad read logs one `fault` line and the loop
- continues. Each sample logs `entity+0xD8` both as three floats and as three
- doubles, plus a `sane=` flag (finite and inside ±1e7).
+ continues. Each sample logs the Mat34 translation and forward vector,
+ and keeps the old `entity+0xD8` qwords as an `old=` column. `sane=1` is
+ set only from the translation floats.
 - `hfw-probe.cs` — loader. Refuses to run unless the exe's SHA-256 is
  `9cec6626…02055429e` **and** the PE stamp is `667B1777-949F000` (Strikers'
  guard plus the hash). `--selftest` checks the anchor bytes above, including
@@ -330,7 +333,9 @@ dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
 ```
 
 11/11 PASS against the binaries-only workspace copy of the exe: SHA-256 + PE
-guard, the three Strikers rows, and all six anchors above.
+guard, the three Strikers rows, and the anchors above, including the
+`GetWorldTransform` prologue at RVA `0x962640` and the Mat34 load at
+`0x962697`.
 
 ### Runtime test (2026-10-21, owner launched the game)
 
@@ -376,9 +381,39 @@ is now 10 Hz, one flush per sample, 450 samples, `THREAD_PRIORITY_BELOW_NORMAL`.
 
 A targeted `-noanalysis` pass on the existing Ghidra project
 (`local/ghidra_scripts/FixPlayerChain*.java`, reports `local/fix_player_chain*.txt`)
-confirmed the entity getter and rejected the float Vec3. No new anchor was
-written into the DLL. The next live log has to show `sane=1` on the `f64=`
-triple before this is a player transform.
+confirmed the entity getter and rejected the float Vec3. The follow-up
+(`FindWorldXform.java`, `DecompileXform.java`) found the real reader.
+
+`Entity_ExportedGetWorldTransform` (string RVA `0x18AB5E0`) is registered by
+`FUN_14095bfb0`. That registrar is called from `FUN_1409476e0` at RVA
+`0x94870A`, and the function pointer passed in the stack argument is
+`FUN_140962640` (the `LEA` at RVA `0x9486FE` targets `0x962640`, which is
+code, not a pointer slot). `FUN_140962640` takes the entity, locks
+`entity+0x298`, and copies:
+
+- three qwords at `+0xD8`, `+0xE0`, `+0xE8` — the rejected read,
+- a 0x3C-byte `Mat34` at `+0xF0` (`vmovups ymm0, [rdi+0xF0]` at RVA
+ `0x962697`, then the rest through `+0x128`),
+- one float at `+0x110`.
+
+`FUN_140962440`, the export bound just before it, reads the same `+0xF0`
+matrix and transposes it, which is what a 3x4 row-major matrix looks like
+when a caller wants columns. `WorldPosition` (`FUN_1401cba60`) is a separate
+three-double type used by the fact system; nothing in that printer reads the
+player entity.
+
+So the world position is the last row of that matrix: floats at
+`entity+0x114`, `+0x118`, `+0x11C`. The forward vector is row 2, at
+`+0x108`, `+0x10C`, `+0x110`. `sane=1` is computed from the translation
+only. The old three qwords stay in the log as `old=` and never set the flag.
+
+No stable world id was found. `[[scene+0x248]]` is the counter the live log
+already measured (`0x2280` to `0x32AC`). The scene-manager script exports
+(`GetWorldTransform`, `GetPosition`, `GetWorldNode`) are registrars of the
+same shape, not a resource id. The probe logs that dword as `counter=`.
+
+The next live log has to show `sane=1` on `pos=` before this is confirmed
+in a running game. The matrix layout itself is what the export copies.
 
 ### Runtime test (blocked — manual steps, superseded)
 
@@ -403,14 +438,17 @@ To run it:
  `hfw-probe.exe --exe "<game dir>\HorizonForbiddenWest.exe" --seconds 45`.
  The loader checks the hash, injects `hfw_probe.dll`, and waits. The log is
  `hfw-probe.log` in the game's working directory. A good sample has `sane=1`
- and an `f64=(x,y,z)` in metres. `sane=0` means the qword layout is still
- wrong — do not keep the game running to retry.
+ and a `pos=(x,y,z)` in metres, with `fwd=(x,y,z)` a unit-ish direction.
+ `old=` is the rejected `+0xD8` qwords, kept so the two reads can be compared.
+ `sane=0` means the Mat34 row is still wrong — do not keep the game running
+ to retry. `counter=` is `[[scene+0x248]]` and is expected to keep climbing.
 4. Close the game. Do not leave it running.
 
 ## Not tried (next session)
 
-- Runtime confirmation of a real transform (`sane=1` on the `f64` triple).
- The entity pointer is live; the Vec3-float read is not.
+- Runtime confirmation of the Mat34 translation (`sane=1` on `pos=`).
+ The entity pointer is live; the `+0xD8` read is not a position; the export
+ copies a Mat34 from `+0xF0`. No stable world id yet — `counter=` climbs.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
