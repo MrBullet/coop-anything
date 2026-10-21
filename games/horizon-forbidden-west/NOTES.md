@@ -1,17 +1,14 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, READ-CAM READY** (2026-10-21) — `--read-cam` is
-opt-in and read-only. It waits until `GameModule*` at `0x148983150`
-is non-null (same gate as `--read-slot`), then samples the qword at
-`0x148982CB0` for 10 s at 2 Hz and logs `cam ptr=0x.. lock20=0x..`.
-`lock20` is the first qword at `[ptr+0x20]` only when `ptr` is
-non-null, inside SEH. It does not call `AcquireSRWLockExclusive`,
-`FUN_140d73270`, `FUN_14134c950`, or `FUN_1413d8470`, and it writes
-nothing. A line with `ptr` not 0 means the manager is alive. The live
-value after a save load has not been read yet; this flag is that
-read. `--add-player` still does not call `FUN_1401e6100`,
-`FUN_140d73270`, or the player-list insert. `--spawn-once` still does
-not call `FUN_14134c950`. `--read-slot` is unchanged. Default is still
+Status: **phase 5, ADD-PLAYER UNBLOCKED** (2026-10-21) — `--add-player`
+is a one-shot. It waits until `GameModule*`, `[module+0x50]`, the
+entity at `[[module+0x50]+0x20]`, `[0x148982CB0]` and the player count
+at `[PlayerManager+8]` are all non-null / `>= 1`, logs them, then
+calls `FUN_1401e6100(0x210)` once, `FUN_140d73270(block, entity)` once
+and `FUN_1402250c0(pm+8, &slot)` once, and exits. It does not call
+`FUN_1413d8470`, `FUN_14134c950` or `FUN_14101bd70`, and it does not
+write `entity+0xD8`. `--read-cam` and `--read-slot` stay read-only.
+`--spawn-once` still does not call `FUN_14134c950`. Default is still
 the 45 s sampler. Claim issue: cranebeaker/coop-anything#83. See
 [DECISION.md](DECISION.md).
 
@@ -1338,16 +1335,15 @@ and does not allocate. Not called. `--spawn-once` stays blocked.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised again: `[0x148982CB0]` is a
+- Milestone 2, revised again and then read live: `[0x148982CB0]` is a
  `CameraPredictionManager*` published by `FUN_140d5e2c0` at
- `0xD5FA19` and cleared by `FUN_140d60010` at `0xD60547`. Next is a
- read-only probe of that one qword after a save load. If it is
- non-null, the constructor's `AcquireSRWLockExclusive(RDI+0x20)` has
- a lock to take; if it is null, the startup store did not survive.
- Do not call `FUN_14134c950`. Do not call `FUN_1413d8470`. Do not
- call `FUN_140d73270` from that probe. Do not write the double3. Do
- not call `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
- `FUN_140d8c2d0`.
+ `0xD5FA19` and cleared by `FUN_140d60010` at `0xD60547`. The owner
+ ran `--read-cam` after a save load and the pointer was
+ `0x235749C3E80` for all 20 samples (`lock20=0x0`, unlocked,
+ `faults=0`). `--add-player` is the one-shot below. Do not call
+ `FUN_14134c950`. Do not call `FUN_1413d8470`. Do not call
+ `FUN_14101bd70`. Do not write the double3. Do not store to
+ `entity+0xD8`. Do not emit `FUN_140d8c2d0`.
 
 ### `--add-player` blocked (2026-10-21, Ghidra `-noanalysis`)
 
@@ -1558,32 +1554,124 @@ is non-null after a save load was not read from a process this
 session; the static evidence says the startup store fills it and only
 the shutdown virtual clears it.
 
-The constructor is still not called. `--read-cam` is the read that
-was missing: mode byte 4, same `GameModule*` gate as `--read-slot`,
-then 10 s at 2 Hz of `cam ptr=0x.. lock20=0x..`. `ptr` is
-`[0x148982CB0]`. `lock20` is `[ptr+0x20]` only when `ptr` is
-non-null, inside SEH, so a live manager shows the SRWLOCK was
-initialized without calling `AcquireSRWLockExclusive`. A line with
-`ptr` not 0 is the manager alive. It calls no game function and
-writes nothing. `--add-player` stays the blocked log.
-`--spawn-once` and `--read-slot` are unchanged.
+The constructor is still not called from `--read-cam`. That flag is
+the read that was missing, and the owner ran it. `--add-player` is
+unblocked below. `--spawn-once` and `--read-slot` are unchanged.
+
+### `--read-cam` live (2026-10-21, owner's log)
+
+After a save load, 20 samples at 2 Hz, `faults=0`. The pointer did
+not move:
+
+```
+read-cam start hz=2 samples=20 gate=GameModule@0x8983150 qword=0x8982CB0 read-only no-call
+cam ptr=0x235749C3E80 lock20=0x0
+read-cam stop samples=20 faults=0
+```
+
+`lock20=0x0` is not a missing store. `FUN_1409581c0` initializes the
+`SRWLOCK` at `this+0x20` with `InitializeSRWLock`, and an
+`InitializeSRWLock` lock stays 0 until a thread acquires it. Zero
+means unlocked. The `CameraPredictionManager` at `0x235749C3E80` is
+alive. The startup store at `0xD5FA19` survived the save load.
+
+### `--add-player` unblocked (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only, after the live read above. One Ghidra
+`-noanalysis -readOnly -process` pass
+(`local/ghidra_scripts/CtorGlobals.java`, `CtorFull.java`,
+`CtorRest.java`; reports `local/ctor_globals.txt`,
+`local/ctor_full.txt`, `local/ctor_rest.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`.
+
+`FUN_140d73270` from the lock acquire to the return loads one global:
+
+```
+RVA 0xD733C2 MOV RDI, [0x148982CB0]
+RVA 0xD733C9 LEA RBX, [RDI+0x20]
+RVA 0xD733D3 CALL [0x14174B1C8] ; PTR_AcquireSRWLockExclusive
+RVA 0xD733D9 TEST RSI, RSI
+RVA 0xD733E0 CMOVZ R14, RBP
+RVA 0xD733E7 CALL 0x1400fe310
+RVA 0xD733F4 CALL [0x14174B1C0] ; PTR_ReleaseSRWLockExclusive
+RVA 0xD7340F RET
+```
+
+`RSI` there is the `PlayerGame` block (`MOV RSI, RCX` at `0xD73282`),
+which the probe allocated. `RBP` is zero (`XOR EBP, EBP` at
+`0xD7328A`). `R14` is `LEA R14, [RSI+0x130]` from `0xD7329A`, the
+sub-object appended into the camera manager's list at `+0x30`. The
+`TEST RSI` / `CMOVZ` swaps in the zero only if the block itself is
+null. `FUN_1400fe310` then reads `[RCX]` and `[RCX+8]`, and `RCX` is
+`RDI+0x30` on the manager the live log just proved non-null. It
+grows that list through `FUN_1401e6260`, which is the same TLS
+allocator family as `FUN_1401e6100` and has null tests on both
+arguments.
+
+The rest of the constructor, before the lock, was re-read in the same
+pass. Its globals:
+
+| Site | What it loads | Null test |
+|---|---|---|
+| `0xD732F7` | `YMM` constant at `0x141FDFFD0` (`.rdata`) | none needed, static |
+| `0xD73307` | dword at `0x141FDFFF0` (`.rdata`) | none needed, static |
+| `0xD7339C` | `[0x148982D88]` | `TEST RCX` / `JZ 0xD733C2` |
+| `0xD733C2` | `[0x148982CB0]` | none in the function; live and non-null |
+
+`FUN_140913be0`, called at `0xD73285` with the block and the entity,
+loads one global: `[0x148982FE8]` at `0x913CCA`, behind
+`TEST RAX` / `JZ 0x913CE5`. The only thing it stores from the entity
+argument is `[this+0x30]` at `0x913CB7`. Its other call is
+`InitializeSRWLock` through the IAT.
+
+So the only unchecked pointer load in the constructor was
+`[0x148982CB0]`, and the owner's log shows it live. The one-shot
+still waits until that qword, the entity and the player count are
+non-null before it calls anything, because a second launch can be
+back at the menu.
+
+The insert is not `FUN_140d8c2d0`. That function calls
+`[PlayerGame+0x68]` at `0xD8C313` and `[PlayerGame+0x60]` at
+`0xD8C33D` before the push, and those slots are not proven. The push
+itself, re-read from `FUN_1402250c0`:
+
+```
+RVA 0x2250D0 MOV EDI, [RCX] ; count
+RVA 0x2250D2 MOV R14, RDX ; &slot
+RVA 0x2250D5 MOV R8, [RCX+0x8] ; storage
+RVA 0x225142 MOV RAX, [R14]
+RVA 0x22514A MOV [R8+RCX*8], RAX
+RVA 0x22515A MOV [RBX], ECX ; new count
+```
+
+`RCX` is the list header (`pm+8`) and `RDX` is the address of a
+local holding the `PlayerGame*`. The game's site does the same with
+`MOV [RSP+0x78], RBX` at `0xD8C385` and `LEA RDX, [RSP+0x78]` at
+`0xD8C38E`. The probe does that itself and calls `FUN_1402250c0`
+directly. It does not call `FUN_140d8c2d0`, so the `LOCK INC
+[RBX+0x18]` at `0xD8C38A` is not emitted either.
+
+`AcquireSRWLockExclusive` inside the constructor blocks while the
+game holds the lock at `[cam+0x20]`. That is a hitch, not an access
+violation. The probe does not replace the game's call. One shot only.
 
 After a save load, from `probe\bin\Release\net10.0` (the shell
 returns immediately; the log is `M:\Horizon Forbidden West\hfw-probe.log`;
 if that file is missing, read `hfw-probe-run.txt` beside the exe):
 
 ```
-Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--read-cam'
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--add-player'
 ```
 
-This only reads. No hitch expected. Alt-f4 first only if a previous
-probe DLL is still wedged in the game; otherwise it can run on the
-current session. The loader still prefers `hfw_probe_new.dll` when
-that file sits beside a mapped `hfw_probe.dll`.
+Load a save first. A hitch is possible while the constructor holds
+the camera lock; alt-f4 if the game wedges. This does not write the
+player's position. A success line is `add-player stop count=2 seh=0x00000000`.
 
-Selftest is 27/27 on the offline exe. The new anchor is the publish
-store (`48 89 1D 90 32 C2 07` at `0xD5FA19`). The constructor load
-(`48 8B 3D E7 F8 C0 07` at `0xD733C2`) was already checked.
+Selftest is 29/29 on the offline exe. The two new anchors are the
+prologues the one-shot calls: `FUN_1401e6100` at `0x1E6100`
+(`48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58`) and
+`FUN_1402250c0` at `0x2250C0`
+(`48 89 5C 24 18 48 89 7C 24 20 41 56`).
 
 ## Sources
 

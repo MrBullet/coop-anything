@@ -21,12 +21,17 @@
  * plus50 is [module+0x50]. entity is [[module+0x50]+0x20] when plus50
  * is non-null, else 0. No game function is called. Nothing is written.
  *
- * --add-player (opt-in, mode byte 3): does NOT call FUN_1401e6100,
- * FUN_140d73270, or FUN_1402250c0. The constructor is unsafe from this
- * thread: at RVA 0xD733C2 it does MOV RDI,[0x148982CB0] and at 0xD733D3
- * CALL [0x14174B1C8] with RCX = RDI+0x20 and no null test. The insert
- * arm also calls PlayerGame vtable +0x60/+0x68 before the pm+8 push.
- * This mode logs the block and exits. It does not write entity+0xD8.
+ * --add-player (opt-in, mode byte 3): one shot, then exit. Waits until
+ * GameModule*, [module+0x50], [[module+0x50]+0x20], [0x148982CB0] and
+ * the player count at [PlayerManager+8] are all non-null / >= 1.
+ * Then, each exactly once and inside SEH:
+ * FUN_1401e6100(RCX=0x210) as at RVA 0x13D852E,
+ * FUN_140d73270(RCX=block, RDX=entity) as at RVA 0x13D853A,
+ * FUN_1402250c0(RCX=pm+8, RDX=&slot) as at RVA 0xD8C385/0xD8C393.
+ * The vtable calls at 0xD8C313 and 0xD8C33D are not emitted.
+ * FUN_1413d8470, FUN_14134c950 and FUN_14101bd70 are not called.
+ * entity+0xD8 is not written. AcquireSRWLockExclusive inside the
+ * constructor can hitch if the game holds the lock at +0x20.
  *
  * --read-cam (opt-in, mode byte 4): also read-only. Same gate as
  * --read-slot: waits until GameModule* at RVA 0x8983150 is non-null,
@@ -97,8 +102,15 @@
 #define RVA_SPAWN_CTX 0x89581F0ull
 
 /* FUN_140d73270 at RVA 0xD733C2: MOV RDI, [0x148982CB0], then
- * LEA RBX,[RDI+0x20] / CALL [0x14174B1C8] with no TEST RDI. */
+ * LEA RBX,[RDI+0x20] / CALL [0x14174B1C8] with no TEST RDI.
+ * --read-cam (2026-10-21, 20 samples, faults=0) saw this qword
+ * non-null after a save load. lock20=0 is an unlocked SRWLOCK. */
 #define RVA_CTOR_SCENE 0x8982CB0ull
+#define RVA_ALLOC 0x1E6100ull
+#define RVA_PLAYER_CTOR 0xD73270ull
+#define RVA_LIST_PUSH 0x2250C0ull
+#define PLAYER_GAME_SIZE 0x210
+#define ADD_WAIT_TICKS 120 /* 60 s at 2 Hz */
 
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
@@ -162,27 +174,116 @@ static DWORD WINAPI spawn_once(LPVOID unused)
  return 0;
 }
 
-/* Do not call FUN_1401e6100, FUN_140d73270, or the pm+8 insert.
- * The constructor's first unchecked deref is the scene global. */
+typedef unsigned long long (__fastcall *alloc_fn)(unsigned long long size);
+typedef unsigned long long (__fastcall *ctor_fn)(unsigned long long block,
+ unsigned long long entity);
+typedef void (__fastcall *push_fn)(unsigned long long list,
+ unsigned long long *slot);
+
+/* One shot. The constructor's only unchecked global is [0x148982CB0],
+ * which --read-cam saw live. FUN_140d8c2d0's vtable calls are not
+ * reproduced; the push is the pm+8 arm only. */
 static DWORD WINAPI add_player(LPVOID unused)
 {
  FILE *fp;
- unsigned long long scene = 0;
+ int waited = 0;
+ unsigned long long base;
+ unsigned long long module = 0;
+ unsigned long long plus50 = 0;
+ unsigned long long entity = 0;
+ unsigned long long cam = 0;
+ unsigned long long pm = 0;
+ int count = 0;
+ unsigned long long block = 0;
+ unsigned long long built = 0;
+ unsigned long long slot = 0;
+ int count_after = 0;
+ unsigned int seh = 0;
  (void)unused;
 
  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
  fopen_s(&fp, "hfw-probe.log", "w");
  if (!fp) return 0;
- setvbuf(fp, NULL, _IOFBF, 8192);
- scene = rd64(exe_base() + RVA_CTOR_SCENE);
+ setvbuf(fp, NULL, _IONBF, 0);
+
  fprintf(fp,
- "add-player blocked: FUN_140d73270 derefs [0x148982CB0] "
- "(MOV RDI,[0x148982CB0] at RVA 0xD733C2, then LEA RBX,[RDI+0x20] "
- "at 0xD733C9 and CALL [0x14174B1C8] at 0xD733D3 with no null test). "
- "live qword=0x%llX. alloc FUN_1401e6100 (RCX=size, site 0x13D852E) "
- "and insert FUN_1402250c0 (RDX=&PlayerGame in RBX, site 0xD8C393) "
- "not called. count stays.\n",
- scene);
+ "add-player start one-shot gate=GameModule@0x8983150 "
+ "plus50 entity cam count>=1\n");
+
+ while (!g_stop && waited < ADD_WAIT_TICKS) {
+ base = exe_base();
+ module = rd64(base + RVA_GAME_MODULE);
+ plus50 = module ? rd64(module + OFF_MODULE_SLOT) : 0;
+ entity = plus50 ? rd64(plus50 + OFF_SLOT_ENTITY) : 0;
+ cam = rd64(base + RVA_CTOR_SCENE);
+ pm = rd64(base + RVA_PLAYER_MANAGER);
+ count = pm ? (int)rd32(pm + OFF_LIST_COUNT) : 0;
+ if (module && plus50 && entity && cam && pm && count >= 1) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp,
+ "add-player gate module=0x%llX plus50=0x%llX entity=0x%llX "
+ "cam=0x%llX pm=0x%llX count=%d waited_s=%d faults=%ld\n",
+ module, plus50, entity, cam, pm, count, waited / SLOT_HZ, g_faults);
+
+ if (!module || !plus50 || !entity || !cam || !pm || count < 1) {
+ fprintf(fp,
+ "add-player timeout. FUN_1401e6100, FUN_140d73270 and "
+ "FUN_1402250c0 not called. count stays %d.\n",
+ count);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ base = exe_base();
+ __try {
+ alloc_fn alloc = (alloc_fn)(base + RVA_ALLOC);
+ block = alloc(PLAYER_GAME_SIZE);
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ fprintf(fp, "add-player alloc block=0x%llX seh=0x%08X\n", block, seh);
+ if (!block || seh) {
+ fprintf(fp, "add-player stop count=%d seh=0x%08X (ctor and insert not called)\n",
+ count, seh);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ __try {
+ ctor_fn ctor = (ctor_fn)(base + RVA_PLAYER_CTOR);
+ built = ctor(block, entity);
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ fprintf(fp, "add-player ctor built=0x%llX seh=0x%08X\n", built, seh);
+ if (seh || built != block) {
+ fprintf(fp,
+ "add-player stop count=%d seh=0x%08X (insert not called)\n",
+ count, seh);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ slot = block;
+ __try {
+ push_fn push = (push_fn)(base + RVA_LIST_PUSH);
+ push(pm + OFF_LIST_COUNT, &slot);
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ count_after = (int)rd32(pm + OFF_LIST_COUNT);
+ fprintf(fp,
+ "add-player stop count=%d seh=0x%08X block=0x%llX\n",
+ count_after, seh, block);
  fflush(fp);
  fclose(fp);
  return 0;

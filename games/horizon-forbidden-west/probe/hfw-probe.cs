@@ -21,12 +21,18 @@
 // A line with plus50 non-null is the slot being live. --spawn-once
 // stays the blocked log.
 //
-// --add-player: opt-in. Mode byte 3. The DLL does not call
-// FUN_1401e6100, FUN_140d73270, or the insert. FUN_140d73270 at
-// RVA 0xD733C2 loads [0x148982CB0] into RDI and the next call
-// (0xD733D3) uses RDI+0x20 with no null test. The flag still
-// injects, but the thread only logs "add-player blocked" and exits.
-// Do not expect count=2. --spawn-once and --read-slot are unchanged.
+// --add-player: opt-in. Mode byte 3. One shot, then the thread exits.
+// Waits until GameModule*, [module+0x50], the entity at
+// [[module+0x50]+0x20], [0x148982CB0] and the player count at
+// [PlayerManager+8] are all non-null / >= 1, logs them, then calls
+// FUN_1401e6100(0x210) once, FUN_140d73270(block, entity) once and
+// FUN_1402250c0(pm+8, &slot) once. The vtable calls inside
+// FUN_140d8c2d0 are not emitted. FUN_1413d8470, FUN_14134c950 and
+// FUN_14101bd70 are not called, and entity+0xD8 is not written.
+// The constructor takes AcquireSRWLockExclusive on the camera
+// manager; that can hitch if the game holds the lock. A success
+// line is "add-player stop count=2 seh=0x00000000".
+// --spawn-once and --read-slot are unchanged.
 //
 // --read-cam: opt-in. Mode byte 4. Same gate as --read-slot (GameModule*
 // at RVA 0x8983150 non-null), then for 10 s at 2 Hz logs
@@ -176,7 +182,7 @@ internal static class Program
  // the block and does not call FUN_14134c950. --read-slot injects a
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
- // 2 read-slot, 3 add-player (blocked), 4 read-cam.
+ // 2 read-slot, 3 add-player (one shot), 4 read-cam.
  var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : 0)));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
@@ -212,10 +218,12 @@ internal static class Program
  if (addPlayer)
  {
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=add-player. " +
- "FUN_140d73270 is not called (deref [0x148982CB0] at RVA 0xD733C2 has no null test). " +
- "FUN_1401e6100 and the insert are not called either. " +
+ "one shot: FUN_1401e6100, FUN_140d73270, FUN_1402250c0, then exit. " +
+ "FUN_1413d8470 and FUN_14134c950 are not called. entity+0xD8 is not written. " +
  "log is hfw-probe.log in the game's working directory. " +
- "expect a line starting with 'add-player blocked'. do not expect count=2.");
+ "load a save first. AcquireSRWLockExclusive inside the constructor can hitch; " +
+ "alt-f4 if the game wedges. a success line is 'add-player stop count=2 seh=0x00000000'. " +
+ "this does not write the player's position.");
  return 0;
  }
  if (readCam)
@@ -455,15 +463,20 @@ internal static class Program
  // size dword the spawn function passes to FUN_1401e6100 (0x210).
  ("spawn alloc size", 0x21615A0, "10 02 00 00"),
  // FUN_1401e6100 at the NetPlayerGame site. RCX is the size
- // (MOVSXD RCX,EDX), not a type-record pointer. --add-player does
- // not call it: the constructor that would consume the block is blocked.
+ // (MOVSXD RCX,EDX), not a type-record pointer. --add-player calls
+ // this entry with RCX=0x210, then FUN_140d73270, then FUN_1402250c0.
  ("alloc call site", 0x13D852B, "48 63 CA E8 CD DB E0 FE"),
  // FUN_140d73270(RDI, RSI) immediately after that alloc.
  ("ctor call site", 0x13D853A, "48 8B D6 48 8B CF E8 2B AD 99 FF"),
- // The unchecked deref that blocks the constructor from a foreign thread.
+ // The camera global. --read-cam saw it non-null after a save load,
+ // so the constructor's unchecked load of it is no longer a block.
  ("ctor scene load", 0xD733C2, "48 8B 3D E7 F8 C0 07"),
  // FUN_140d5e2c0 publishes CameraPredictionManager* into the BSS qword.
  ("cam qword store", 0xD5FA19, "48 89 1D 90 32 C2 07"),
+ // FUN_1401e6100 and FUN_1402250c0 prologues. The one-shot calls these
+ // entries directly; the bytes are the ones the call sites land on.
+ ("alloc FUN_1401e6100", 0x1E6100, "48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58"),
+ ("insert FUN_1402250c0", 0x2250C0, "48 89 5C 24 18 48 89 7C 24 20 41 56"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  // FUN_140d63060 writes the published GameModule's +0x50. The load of
