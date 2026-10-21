@@ -1,15 +1,17 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, ADD-PLAYER ALLOC ONLY** (2026-10-21) — `--add-player`
-is a one-shot that stops after `FUN_1401e6100(0x210)`. It does not
-call `FUN_140d73270` and it does not call `FUN_1402250c0`, so it does
-not insert into the player list and it does not publish the block
-onto the camera manager. The count stays 1. It does not call
+Status: **phase 5, SECOND ENTITY FOUND, NOT CALLED** (2026-10-21) —
+`--add-player` is unchanged and still stops after `FUN_1401e6100(0x210)`.
+It does not call `FUN_140d73270` and it does not call `FUN_1402250c0`,
+so it does not insert into the player list and it does not publish the
+block onto the camera manager. The count stays 1. It does not call
 `FUN_1413d8470`, `FUN_14134c950` or `FUN_14101bd70`, and it does not
-write `entity+0xD8`. No second character. `--read-cam` and
-`--read-slot` stay read-only. `--spawn-once` still does not call
-`FUN_14134c950`. Default is still the 45 s sampler. Claim issue:
-cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
+write `entity+0xD8`. No second character. A separate allocator,
+`FUN_1401f82b0`, constructs a `ControlledEntity` (size `0x300`, type
+record RVA `0x21DA6C0`) without taking the owner's entity. It was not
+called. `--read-cam` and `--read-slot` stay read-only. `--spawn-once`
+still does not call `FUN_14134c950`. Default is still the 45 s sampler.
+Claim issue: cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 The BSS qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
@@ -1784,6 +1786,126 @@ Selftest is 32/32 on the offline exe, including the two walker loads
 (`49 8B 80 E8 00 00 00` at `0x916AC8`, `48 8B 88 E8 00 00 00` at
 `0x916C43`) and the constructor's camera-list publish
 (`48 8D 4F 30 4C 0F 44 F5 49 8B D6 E8 24 AF 38 FF` at `0xD733DC`).
+
+### A second entity, not the owner's (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only. HEAD `9c3c94c` verified. Probe code was not rebuilt and
+was not changed. `--add-player` still stops after `FUN_1401e6100(0x210)`.
+No inject, no launch, nothing written under `M:\`. One
+`-noanalysis -readOnly -process` pass per script
+(`local/ghidra_scripts/EntityAlloc.java` through `EntityAlloc13.java`,
+reports `local/entity_alloc.txt` through `local/entity_alloc13.txt`).
+No re-analysis, no symbol-table scan. The `.rdata`/`.data` qword search
+in `EntityAlloc8.java` looked for three known ctor addresses only.
+
+**(a).** There is an allocator that constructs an entity of the same
+kind as `[[GameModule+0x50]+0x20]` and does not receive the owner's
+entity. It was not called.
+
+What the camera publish actually is. Re-read, not re-argued.
+`FUN_1400fe310` (`0xFE310`, 133 bytes) is a pointer-vector push:
+`[RCX]` is the count, `[RCX+4]` the capacity, `[RCX+8]` the array, and
+the element store is `MOV [RCX+RBP*8], R14` at `0xFE385`. The call at
+`0xD733E7` passes `RCX = [0x148982CB0]+0x30` and `RDX = PlayerGame+0x130`
+(`LEA R14, [RSI+0x130]` at `0xD7329A`). The element is the `PlayerGame`
+sub-object, not an entity. 397 call sites; the other bases are other
+objects' vectors (`FUN_14043b260` eight times, `FUN_140434550`,
+`FUN_140d5e2c0` at `0xD5EA7D` pushing onto `[0x148982C40]+0xB8`). None
+of them allocate an entity.
+
+The owner's entity is not allocated on the path that hands it over.
+`FUN_14134bf40` (`0x134BF40`) unwraps `[[[0x148983150]+0x490]+0x88]` and
+passes the result to `FUN_140d63060`, which stores it at
+`[GameModule+0x50]` (`MOV [RDI+0x50], RBX` at `0xD63090`). The entity is
+one field further, `[that+0x20]`, loaded by `FUN_14134c950` at
+`0x134C9FE` and by `FUN_1413d8470` at `0x13D84A4`. Both of those stay
+uncalled. `FUN_140d63060` does not allocate that object.
+
+The entity constructor is `FUN_140948a10` (`0x948A10`, 833 bytes). It
+takes the object in `RCX`; it does not allocate. Its ten direct callers
+are derived constructors, and each one also takes the object in `RCX`
+and then overwrites the vtables `FUN_140948a10` installed:
+
+| ctor | RTTI |
+|---|---|
+| `FUN_140998180` | `CameraEntity` |
+| `FUN_140b28e60` / `FUN_140b2f400` | `SequenceEntity` / `Sequence` |
+| `FUN_140ec6170` | `GravityPocket` |
+| `FUN_1411a0980` | `ControlledEntity` |
+| `FUN_1411a7df0` | `Humanoid` |
+| `FUN_1412691f0` | `Explosion` |
+| `FUN_1412730f0` | `BulletSystem` |
+| `FUN_141284ae0` | `Throwable` |
+| `FUN_14128caa0` | `InventoryWeapon` |
+
+`ControlledEntity` is the one the spawn path's entity matches: the
+secondary vtable `FUN_140948a10` writes at `+0x20` is replaced by
+`FUN_1411a0980` with `0x1419588C0` (`.?AVControlledEntity@@`). A
+`CameraEntity` or a `Sequence` is not this object. The placement thunk
+at `0x9476A0` (`TEST RDX,RDX / MOV RCX,RDX / JMP FUN_140948a10`) has
+data references only, no direct `CALL`.
+
+The allocator. `ControlledEntity`'s Decima type record is at RVA
+`0x21DA6C0`. Bytes there:
+
+```
+FF FF FF FF 04 00 01 00 00 00 FF 00 00 00 00 00
+00 03 00 00 10 00 00 00 80 09 1A 41
+```
+
+Tag byte at `+0x4` is `0x04`. `FUN_1402032d0` case 4 returns the dword
+at `+0x10`, which is `00 03 00 00` (`0x300`). The qword at `+0x18` is
+`0x1411A0980`, `FUN_1411a0980`. The name at the record's string slot is
+`ControlledEntity`.
+
+`FUN_1401f82b0` (`0x1F82B0`, 1140 bytes) is the generic factory that
+consumes a record of that shape. `R8` is the type record:
+
+```
+RVA 0x1F85D0 CALL 0x1402033d0   ; RAX = [record+0x18], the ctor
+RVA 0x1F85D5 MOV RBX, RAX
+RVA 0x1F85D8 CALL 0x1402032d0   ; EAX = size from the record
+RVA 0x1F85DD MOVSXD RCX, EAX
+RVA 0x1F85E0 CALL 0x1401e6100   ; the block
+RVA 0x1F85E5 MOV RCX, [RBP-0x70]
+RVA 0x1F85E9 MOV RDX, RAX
+RVA 0x1F85EC MOV RSI, RAX
+RVA 0x1F85EF CALL RBX           ; placement ctor
+```
+
+For this record that is `FUN_1401e6100(0x300)` followed by
+`FUN_1411a0980(record, block)`, which calls `FUN_140948a10(block)`.
+`RSI` is the new object. It is then wrapped and pushed by
+`FUN_1401f96d0` (`0x1F96D0`, 201 bytes) onto the caller's vector at
+`[container+0x50]`, 0x20-byte elements. That vector is the container
+the caller passed in; it is not the camera manager and not
+`[GameModule+0x50]`.
+
+`FUN_1401f8730` (`0x1F8730`, 985 bytes) is the same sequence at
+`0x1F8A3F`. Both are called from `FUN_1401f7bd0`, `FUN_1401f8d40` and
+`FUN_1401f90a0`, which pass a type record taken from a property array,
+not a fixed address.
+
+What calling it would touch. Scanned the bodies of `FUN_1401f82b0`,
+`FUN_1401f8730`, `FUN_1411a0980` and `FUN_140948a10`: no instruction
+references `0x148983150`, `0x1489581F0`, `0x148982CB0`, `0x148982C80`
+or `0x148983128`, and none calls `FUN_140d73270`, `FUN_14134c950`,
+`FUN_1413d8470`, `FUN_14101bd70`, `FUN_1402250c0` or `FUN_1400fe310`.
+The new block is not the owner's entity. The owner's entity stays
+where it is, and nothing in this chain writes `entity+0xD8`.
+
+Not this. `FUN_140d5e2c0` does allocate `0x490` bytes at `0xD5E308` and
+zeroes `[RAX+0x20]`, but that object gets `StreamingStrategyManagerGame::vftable`
+(`0x18FC188`) and is published to `0x148982A58`. It is not the entity.
+The `+0x88` stores inside that function zero or copy a handle; they do
+not construct one.
+
+Next milestone, not built. A one-shot that calls
+`FUN_1401f82b0` with the `ControlledEntity` record at RVA `0x21DA6C0`
+and a container that is not the camera manager and not the player
+list, then returns the new block. It stops before `FUN_140d73270`.
+The record is data, not a guessed address: tag `0x04`, size `0x300`,
+ctor `FUN_1411a0980`. Calling the factory was not done this session.
 
 ## Sources
 
