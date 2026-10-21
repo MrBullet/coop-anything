@@ -2218,6 +2218,89 @@ No mode ships. `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and
 `--add-player` stays alloc-only. The next run happens only after the
 parent container is named.
 
+### The parent container is an `RTTIMarshallerJSON`, and it is not a global (2026-10-21)
+
+Offline only. Six `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/ParentContainer.java`, `ParentSlot.java`,
+`ParentVtable.java`, `ParentCallers.java`, `ParentSites.java`,
+`ParentDispatch.java`, `ParentParse.java`; reports
+`local/parent_container.txt`, `local/parent_slot.txt`,
+`local/parent_vtable.txt`, `local/parent_callers.txt`,
+`local/parent_sites.txt`, `local/parent_dispatch.txt`,
+`local/parent_parse.txt`). No re-analysis, no symbol scan, no inject,
+no launch, nothing written under `M:\`. No new probe mode.
+
+`FUN_1401f7bd0` has no direct caller. Its two references are data:
+the `.pdata` entry at RVA `0x8BA6AB0`, and one vtable slot. That
+vtable is `JSONParsingHandler::vftable` at RVA `0x17B3738`, and
+`FUN_1401f7bd0` is slot `+0x20` of it (the fourth function pointer,
+at RVA `0x17B3758`). The Complete Object Locator one qword before the
+vtable, at RVA `0x19D3D58`, says offset 32, type descriptor RVA
+`0x2243688`, name `.?AVRTTIMarshallerJSON@@`. The hierarchy under it
+is `RTTIMarshallerJSON` at offset 0, `RTTIMarshaller` at offset 0,
+and `JSONParsingHandler` at offset 32.
+
+So the container the factory is handed is the `RTTIMarshallerJSON`
+object itself. `FUN_1401f7bd0` copies its argument with
+`MOV RDI, RCX` at RVA `0x1F7C04`, and `RDI` there is the
+`JSONParsingHandler` subobject at `marshaller+0x20`. The
+`LEA RBX, [RDI-0x20]` at `0x1F802A` (and again at `0x1F7FB4`) walks
+back to the marshaller, and `MOV RCX, RBX` at `0x1F804B` is what
+`FUN_1401f82b0` receives. It is a JSON loader, not a scene, a world,
+or a spawn list: the same class is what `FUN_1401f5840` builds when
+the content type is `application/json` or `text/json`.
+
+The record `FUN_14094afe0` needs is pushed by `FUN_1401f96d0`
+(`0x1F96D0`). Called with the vector at `handler+0x30`
+(`LEA RBX, [RDI+0x30]` at `0x1F7D31`, `MOV RCX, RBX` at `0x1F7F8F`),
+which is `marshaller+0x50`. The store, with `RBX` that vector, `R8`
+its storage and `RBP` the record:
+
+```
+RVA 0x1F975F C4 A1 78 11 04 01 VMOVUPS xmmword ptr [RCX + R8*1], XMM0
+RVA 0x1F9769 4A 89 44 01 10 MOV qword ptr [RCX + R8*1 + 0x10], RAX
+RVA 0x1F978C 89 0B MOV dword ptr [RBX], ECX
+```
+
+`XMM0` was loaded from `[RBP]` at `0x1F9756`, so the first qword of
+the new record is the first qword of the record passed in `RDX`.
+That is the qword the factory later reads back as `R14`. The call
+inside `FUN_1401f7bd0` that pushes it before the factory runs is the
+second one, at RVA `0x1F7F9C` (`E8 2F 17 00 00`).
+
+The miss. Nothing keeps this object. `RTTIMarshallerJSON::vftable`
+(RVA `0x17B3710`) is written by exactly two functions,
+`FUN_1401f5b50` (`MOV [RCX], RAX` at `0x1F5B88`) and `FUN_1401f5c20`
+(the destructor). Every call site builds the object in a local:
+
+```
+FUN_140434550 at 0x434CA8 LEA RCX, [RBP-0x80]
+FUN_140436f20 at 0x436F96 LEA RCX, [RBP-0x80]
+FUN_14021ae80 at 0x21AEAA LEA RCX, [RSP+0x60]
+FUN_140436bd0 at 0x436C70 LEA RCX, [RBP-0x60]
+FUN_140435790 at 0x435816 LEA RCX, [RSP+0x30]
+```
+
+Each of those calls `FUN_1401f5c20` on the same local before it
+returns. The one heap allocation, `FUN_1401f5840` at `0x1F5914`,
+allocates `0x98` bytes through the TLS allocator at
+`GS:[0x58]+0x1A10` (fallback global `0x14897A388`) and returns the
+pointer to its caller; it does not store it to a global either. There
+is no container global to read after a save load, so that probe is
+not the next step.
+
+`FUN_1401f7bd0` is reached through the handler's own vtable, not by a
+direct call. `FUN_1401f62a0` (`0x1F62A0`, 6395 bytes) is the parser
+every one of those sites hands the marshaller to, and it calls
+`[RBP+0x28]` at `0x1F6FB5` and `0x1F70BF` with the same shape as the
+factory's fifth call. The next milestone, described only, is to name
+that stack slot: which instruction in `FUN_1401f62a0` writes
+`[RBP+0x28]`, and whether it is slot `+0x20` of
+`JSONParsingHandler::vftable`. No call is written. `FUN_1402250c0`,
+`FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70` stay uncalled,
+`entity+0xD8` stays unwritten, `--add-player` stays alloc-only and
+`--link-puppet` stays as shipped.
+
 Selftest is 46/46 on the offline exe. The six new anchors are the
 walker's call (`FF 50 08` at `0x931073`), the count load and its
 `JS` (`8B 93 F0 00 00 00 83 EA 01 78` at `0x91510A`), the constructor's
