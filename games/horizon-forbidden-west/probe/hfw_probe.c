@@ -27,6 +27,12 @@
  * sane=1 only when those three translation floats are finite and inside
  * +/-1e7. The old qwords never set it.
  *
+ * The 2026-10-21 second live run wrote all 450 samples, sane=1 on every
+ * line, counter climbing the whole time, faults=0. pos= never changed.
+ * That freeze was the loader's console taking foreground (HFW pauses on
+ * focus loss), not a stalled worker. This build does not AllocConsole,
+ * does not AttachConsole, and fflush's at most once a second.
+ *
  * [[scene + 0x248]] counted 0x2280 -> 0x32AC on that run, so it is logged
  * as a uint32 counter, not a world id. No stable world id was found.
  *
@@ -100,10 +106,11 @@ static DWORD WINAPI logger(LPVOID unused)
 
  fopen_s(&fp, "hfw-probe.log", "w");
  if (!fp) return 0;
+ /* One flush a second. fflush every sample is disk IO inside the game. */
+ setvbuf(fp, NULL, _IOFBF, 8192);
 
  fprintf(fp, "probe start hz=%d samples=%d read-only no-hook mat34\n",
  SAMPLE_HZ, SAMPLE_COUNT);
- fflush(fp);
 
  for (i = 0; i < SAMPLE_COUNT && !g_stop; i++) {
  unsigned long long base = exe_base();
@@ -156,7 +163,7 @@ static DWORD WINAPI logger(LPVOID unused)
  tx, ty, tz, hx, hy, hz, sane,
  raw[0], raw[1], raw[2]);
  }
- fflush(fp);
+ if ((i % SAMPLE_HZ) == (SAMPLE_HZ - 1)) fflush(fp);
  Sleep(SAMPLE_MS);
  }
 

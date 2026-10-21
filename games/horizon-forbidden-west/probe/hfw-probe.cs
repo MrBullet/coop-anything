@@ -4,6 +4,13 @@
 // It never writes game memory, never hooks Present, and never calls a game
 // function. The loader does not attach a console to the game process.
 //
+// The second live run (450/450 samples, sane=1, counter climbing, pos
+// frozen) froze because this exe is a console process: opening it steals
+// foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
+// subsystem) so it has no console to activate. It also calls
+// AllowSetForegroundWindow(ASFW_ANY) before the wait so the game can
+// take the foreground back. The DLL never AllocConsole / AttachConsole.
+//
 // Injection pattern (Strikers, MIT, github.com/everydayaussie/Strikers):
 // an external .NET process OpenProcess's HorizonForbiddenWest.exe, checks the
 // loaded image identity, VirtualAllocEx + WriteProcessMemory a tiny stub,
@@ -64,25 +71,24 @@ internal static class Program
 
  var exe = Arg(args, "--exe") ?? DefaultExe();
  var seconds = int.TryParse(Arg(args, "--seconds"), out var s) ? s : 45;
- var logPath = Arg(args, "--log") ?? Path.Combine(AppContext.BaseDirectory, "hfw-probe.log");
 
  if (!Guard(exe, out var why))
  {
- Console.Error.WriteLine("REFUSED: " + why);
+ Note("REFUSED: " + why);
  return 2;
  }
 
  var proc = Process.GetProcessesByName("HorizonForbiddenWest").FirstOrDefault();
  if (proc is null)
  {
- Console.Error.WriteLine("REFUSED: HorizonForbiddenWest.exe is not running.");
+ Note("REFUSED: HorizonForbiddenWest.exe is not running.");
  return 3;
  }
 
  var dll = Arg(args, "--dll") ?? Path.Combine(AppContext.BaseDirectory, "hfw_probe.dll");
  if (!File.Exists(dll))
  {
- Console.Error.WriteLine($"REFUSED: probe dll not found: {dll}");
+ Note($"REFUSED: probe dll not found: {dll}");
  return 5;
  }
 
@@ -92,14 +98,35 @@ internal static class Program
  var injected = Inject(proc.Id, Path.GetFullPath(dll), out var whyNot);
  if (!injected)
  {
- Console.Error.WriteLine("REFUSED: inject failed: " + whyNot);
+ Note("REFUSED: inject failed: " + whyNot);
  return 4;
  }
 
- Console.WriteLine($"injected {dll} into pid {proc.Id}; log is hfw-probe.log in the game's working directory.");
- Console.WriteLine($"waiting {seconds}s for frames, then the dll's thread stops on its own.");
+ // HFW pauses when it loses foreground. This process must not become it.
+ // ASFW_ANY lets the game call SetForegroundWindow and take focus back.
+ AllowSetForegroundWindow(AsfwAny);
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ $"waiting {seconds}s; the dll thread stops on its own.");
  Thread.Sleep(TimeSpan.FromSeconds(seconds));
  return 0;
+ }
+
+ private const int AsfwAny = -1;
+
+ // WinExe has no console. Selftest still prints; a live run writes a file
+ // next to the exe so a refusal is visible without a window.
+ private static void Note(string line)
+ {
+ try
+ {
+ Console.Error.WriteLine(line);
+ }
+ catch (IOException)
+ {
+ }
+ var path = Path.Combine(AppContext.BaseDirectory, "hfw-probe-run.txt");
+ File.AppendAllText(path, line + "\r\n");
  }
 
  private const uint ProcessCreateThread = 0x0002;
@@ -370,4 +397,7 @@ internal static class Program
 
  [DllImport("kernel32")]
  private static extern bool CloseHandle(nint h);
+
+ [DllImport("user32")]
+ private static extern bool AllowSetForegroundWindow(int processId);
 }

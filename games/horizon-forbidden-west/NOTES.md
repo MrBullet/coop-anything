@@ -1,10 +1,9 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5 milestone 1 probed live** (2026-10-21) — the injected
-read-only sampler ran 1,500 samples. The entity pointer is stable. The
-float Vec3 at `entity+0xD8` is not a transform, and `[[scene+0x248]]` is a
-counter, not a world id. The 30 Hz `fflush` loop stalled the game; the
-sampler is now 10 Hz. Offline selftest still 11/11.
+Status: **phase 5 milestone 1 probed live** (2026-10-21) — second run,
+450/450 samples, `sane=1`, `pos=(0.000,-26340.094,5.732)` frozen because
+the console loader paused the game. The loader is now a windowless
+`WinExe`. Offline selftest 13/13.
 Runtime injection is blocked: Steam has no library entry for this install, so
 `-applaunch` does not start the game. Manual steps below. Claim issue:
 cranebeaker/coop-anything#83. Route **(c)** — see [DECISION.md](DECISION.md).
@@ -317,11 +316,17 @@ Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
  one `memcpy` inside `__try`. A bad read logs one `fault` line and the loop
  continues. Each sample logs the Mat34 translation and forward vector,
  and keeps the old `entity+0xD8` qwords as an `old=` column. `sane=1` is
- set only from the translation floats.
+ set only from the translation floats. The log is fully buffered and
+ flushed once a second, not on every sample. The DLL does not call
+ `AllocConsole` or `AttachConsole`.
 - `hfw-probe.cs` — loader. Refuses to run unless the exe's SHA-256 is
  `9cec6626…02055429e` **and** the PE stamp is `667B1777-949F000` (Strikers'
  guard plus the hash). `--selftest` checks the anchor bytes above, including
- three Strikers rows, against the exe on disk.
+ three Strikers rows, against the exe on disk. The project is a `WinExe`
+ (PE subsystem 2), so launching it creates no console and does not take
+ foreground. Before it waits it calls `AllowSetForegroundWindow(ASFW_ANY)`
+ so the game can take focus back. Status goes to `hfw-probe-run.txt` beside
+ the exe, not to a window.
 
 Built with the VS 2026 Build Tools already on the machine (`cl 14.51`) and the
 .NET 10 SDK. Nothing new installed. `hfw_probe.dll` is 147,456 bytes.
@@ -415,6 +420,74 @@ same shape, not a resource id. The probe logs that dword as `counter=`.
 The next live log has to show `sane=1` on `pos=` before this is confirmed
 in a running game. The matrix layout itself is what the export copies.
 
+### Runtime test 2 (2026-10-21, owner, Mat34 build)
+
+The owner injected the Mat34 build (`hfw-probe.exe --seconds 45`). The
+DLL wrote the full 45 s and then stopped. No `fault` line. The game froze
+again the moment the loader opened: they could not move, alt-tab showed
+the pause menu, Continue did not resume. The process was not killed from
+here, and saves were not touched. The log was copied to `local/` and not
+left only in the game directory.
+
+452 lines: a start line, 450 samples, a stop line. Quoted first, middle,
+and last sample (every sample has this shape; `pos=` and `fwd=` are
+identical on all 450):
+
+```
+sample=0 counter=0x00002697 entity=0x1C41B0C4280 pos=(0.000,-26340.094,5.732) fwd=(0.000,0.000,1.000) sane=1 old=40B76A4DC6FB7B68 C0A6CF8F42F55099 4074F4826B83DE20
+sample=224 counter=0x00003075 entity=0x1C41B0C4280 pos=(0.000,-26340.094,5.732) fwd=(0.000,0.000,1.000) sane=1 old=40B76A4DC6FB7B68 C0A6CF8F42F55099 4074F4826B83DE20
+sample=449 counter=0x0000365F entity=0x1C41B0C4280 pos=(0.000,-26340.094,5.732) fwd=(0.000,0.000,1.000) sane=1 old=40B76A4DC6FB7B68 C0A6CF8F42F55099 4074F4826B83DE20
+probe stop samples=450 faults=0
+```
+
+What that is:
+
+- `sane=1` on all 450 samples, `sane=0` on none. The three floats at
+ `entity+0x114/+0x118/+0x11C` are finite and inside ±1e7. That is a real
+ Mat34 translation, not the garbage the `+0xD8` float read produced.
+ `pos=(0.000, -26340.094, 5.732)`: X is 0, Z is the same `5.732`
+ (`0x40B76C8B`) the first run misread as Y, Y is about -26.3 km. `fwd=`
+ is the unit +Z vector on every line. The entity pointer is stable,
+ `0x1C41B0C4280` (a different allocation from the first run's
+ `0x18EF75A0380`).
+- `pos=` did not change. They did not walk. The freeze started when the
+ loader's window opened, which is before sample 0, so the transform was
+ sampled from a paused player for the whole file.
+- `counter=` climbed `0x2697 -> 0x365F` (+4040 over 449 steps, no
+ decreases) and the stop line is present. A few plateaus of 4–11 samples
+ sit inside an otherwise steady climb; the counter did not stop early.
+ The process stayed alive for the full 45 s. `faults=0`. This is not a
+ DLL deadlock and not an access violation.
+- `old=` decoded as doubles is `(5994.304, -2919.780, 335.282)`. That is
+ a sane metre-scale triple and it also never moved. `FUN_140962590`
+ copies those three qwords under the same `entity+0x298` lock, and
+ `FUN_140962640` copies them beside the Mat34. The export still treats
+ the Mat34 as the world transform. Both reads agree the player was still.
+
+Why it froze: the loader was a console exe. `dotnet` `OutputType=Exe` is
+PE subsystem 3 (`IMAGE_SUBSYSTEM_WINDOWS_CUI`). Starting it allocates a
+console and that console becomes the foreground window. HFW pauses on
+focus loss, which is the pause menu they saw, and Continue cannot resume
+while the console still owns the foreground. The DLL never called
+`AllocConsole` or `AttachConsole`. The 10 Hz `fflush` was still one
+flush per sample into the game directory, but the counter moving through
+sample 449 rules out a stall: a stuck worker would have stopped the log
+early or frozen the counter.
+
+`FUN_140962640` and `FUN_140962440` were re-read from the existing
+decompile (`local/xform_fns.txt`, no re-analysis). The copy is still
+`+0xD8/+0xE0/+0xE8` then the 0x3C matrix at `+0xF0`, with the trailing
+float at `+0x110`. The transpose reader loads `ymm` from `param_2+0xF0`
+and pulls `+0x110` out as its own dword. The offsets did not move. No
+new offset was guessed.
+
+The loader is now a `WinExe` (subsystem 2, confirmed on the built exe).
+It creates no console. Before the wait it calls
+`AllowSetForegroundWindow(ASFW_ANY)` so the game can take the foreground
+back. Status is appended to `hfw-probe-run.txt` beside the exe. The DLL
+flushes the log once a second instead of once a sample. Offline selftest
+after the rebuild: 13/13 PASS, `SELFTEST OK`.
+
 ### Runtime test (blocked — manual steps, superseded)
 
 Steam is logged in, but `steamapps/libraryfolders.vdf` lists only `C:`, `E:`,
@@ -434,21 +507,29 @@ To run it:
 1. Add the install's drive as a Steam library folder (Steam → Settings →
  Storage → Add Drive), so app 2420110 resolves.
 2. Start the game and load a save so a player entity exists.
-3. From `probe/bin/Release/net10.0`:
- `hfw-probe.exe --exe "<game dir>\HorizonForbiddenWest.exe" --seconds 45`.
- The loader checks the hash, injects `hfw_probe.dll`, and waits. The log is
- `hfw-probe.log` in the game's working directory. A good sample has `sane=1`
- and a `pos=(x,y,z)` in metres, with `fwd=(x,y,z)` a unit-ish direction.
- `old=` is the rejected `+0xD8` qwords, kept so the two reads can be compared.
- `sane=0` means the Mat34 row is still wrong — do not keep the game running
- to retry. `counter=` is `[[scene+0x248]]` and is expected to keep climbing.
+3. From `probe/bin/Release/net10.0`, start it with `Start-Process` so the
+ shell does not attach a console:
+ `Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--seconds','45'`
+ The loader is a windowless `WinExe`. It checks the hash, injects
+ `hfw_probe.dll`, and waits. It must not open a console: a console steals
+ foreground and HFW pauses on focus loss. Status is `hfw-probe-run.txt`
+ next to the exe. The sample log is `hfw-probe.log` in the game's working
+ directory. A good sample has `sane=1` and a `pos=(x,y,z)` in metres, with
+ `fwd=(x,y,z)` a unit-ish direction. `old=` is the `+0xD8` qwords read as
+ doubles (metres), kept so the two reads can be compared. `sane=0` means
+ the Mat34 row is still wrong — do not keep the game running to retry.
+ `counter=` is `[[scene+0x248]]` and is expected to keep climbing. Walk a
+ few metres during the 45 s. The second live run's `pos=` did not move,
+ because the game was paused for the whole sample.
 4. Close the game. Do not leave it running.
 
 ## Not tried (next session)
 
-- Runtime confirmation of the Mat34 translation (`sane=1` on `pos=`).
- The entity pointer is live; the `+0xD8` read is not a position; the export
- copies a Mat34 from `+0xF0`. No stable world id yet — `counter=` climbs.
+- Runtime confirmation that `pos=` tracks a walking player. `sane=1` is
+ confirmed, and the Mat34 row is the export's row. The second live run
+ sampled a paused player (`pos=` fixed, `counter=` still climbing),
+ because the console loader stole focus. The loader is now a windowless
+ `WinExe`; the next run has to be done while walking.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
