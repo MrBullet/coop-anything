@@ -28,6 +28,15 @@
 // injects, but the thread only logs "add-player blocked" and exits.
 // Do not expect count=2. --spawn-once and --read-slot are unchanged.
 //
+// --read-cam: opt-in. Mode byte 4. Same gate as --read-slot (GameModule*
+// at RVA 0x8983150 non-null), then for 10 s at 2 Hz logs
+// cam ptr=0x.. lock20=0x..
+// ptr is the qword at RVA 0x8982CB0 (VA 0x148982CB0). lock20 is the
+// first qword at [ptr+0x20] only when ptr is non-null, inside SEH.
+// It does not call AcquireSRWLockExclusive or any game function and
+// writes nothing. A line with ptr non-null means the manager is alive.
+// Default, --read-slot, --spawn-once and --add-player are unchanged.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -115,13 +124,15 @@ internal static class Program
  var spawnOnce = HasFlag(args, "--spawn-once");
  var readSlot = HasFlag(args, "--read-slot");
  var addPlayer = HasFlag(args, "--add-player");
+ var readCam = HasFlag(args, "--read-cam");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
  Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
  Note(addPlayer ? "add-player flag seen" : "add-player flag absent");
- var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0);
+ Note(readCam ? "read-cam flag seen" : "read-cam flag absent");
+ var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0) + (readCam ? 1 : 0);
  if (modes > 1)
  {
- Note("REFUSED: --spawn-once, --read-slot and --add-player are mutually exclusive.");
+ Note("REFUSED: --spawn-once, --read-slot, --add-player and --read-cam are mutually exclusive.");
  return 2;
  }
 
@@ -165,8 +176,8 @@ internal static class Program
  // the block and does not call FUN_14134c950. --read-slot injects a
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
- // 2 read-slot.
- var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : 0));
+ // 2 read-slot, 3 add-player (blocked), 4 read-cam.
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : 0)));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
@@ -177,6 +188,7 @@ internal static class Program
  Note(mode == 1 ? "injected mode=spawn-once"
  : mode == 2 ? "injected mode=read-slot"
  : mode == 3 ? "injected mode=add-player"
+ : mode == 4 ? "injected mode=read-cam"
  : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
@@ -204,6 +216,15 @@ internal static class Program
  "FUN_1401e6100 and the insert are not called either. " +
  "log is hfw-probe.log in the game's working directory. " +
  "expect a line starting with 'add-player blocked'. do not expect count=2.");
+ return 0;
+ }
+ if (readCam)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=read-cam. " +
+ "no game call, no write, no AcquireSRWLockExclusive. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ "a live manager is a line 'cam ptr=0x.. lock20=0x..' with ptr not 0. " +
+ "samples 10s at 2 Hz after GameModule@0x8983150 is non-null.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -270,7 +291,7 @@ internal static class Program
  // One byte in front of the wide path. The DLL reads it back from its
  // own file (the loader's copy, not the game directory) to decide
  // which thread to start. The remote thread is still LoadLibraryW.
- // 0 sampler, 1 spawn-once (blocked), 2 read-slot.
+ // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam.
  File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
@@ -441,6 +462,8 @@ internal static class Program
  ("ctor call site", 0x13D853A, "48 8B D6 48 8B CF E8 2B AD 99 FF"),
  // The unchecked deref that blocks the constructor from a foreign thread.
  ("ctor scene load", 0xD733C2, "48 8B 3D E7 F8 C0 07"),
+ // FUN_140d5e2c0 publishes CameraPredictionManager* into the BSS qword.
+ ("cam qword store", 0xD5FA19, "48 89 1D 90 32 C2 07"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  // FUN_140d63060 writes the published GameModule's +0x50. The load of

@@ -28,6 +28,16 @@
  * arm also calls PlayerGame vtable +0x60/+0x68 before the pm+8 push.
  * This mode logs the block and exits. It does not write entity+0xD8.
  *
+ * --read-cam (opt-in, mode byte 4): also read-only. Same gate as
+ * --read-slot: waits until GameModule* at RVA 0x8983150 is non-null,
+ * then samples the qword at RVA 0x8982CB0 (VA 0x148982CB0) for 10 s
+ * at 2 Hz. Each sample is one line:
+ * cam ptr=0x.. lock20=0x..
+ * lock20 is the first qword at [ptr+0x20] only when ptr is non-null,
+ * and that read is inside the same SEH as every other deref. It does
+ * not call AcquireSRWLockExclusive, FUN_140d73270, FUN_14134c950, or
+ * FUN_1413d8470. It writes nothing.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -78,6 +88,8 @@
 #define SLOT_MS (1000 / SLOT_HZ)
 #define SLOT_SAMPLES 40 /* 20 s at 2 Hz */
 #define SLOT_WAIT_TICKS 120 /* 60 s at 2 Hz for the GameModule global */
+#define CAM_SAMPLES 20 /* 10 s at 2 Hz */
+#define OFF_CAM_LOCK 0x20
 
 /* FUN_14134c950 is not called. First unchecked deref is
  * RVA 0x134C9BA: MOV RCX, [RAX+0xF8] where RAX came from
@@ -259,6 +271,68 @@ static DWORD WINAPI read_slot(LPVOID unused)
  return 0;
 }
 
+/* Same GameModule gate as read_slot, then sample [0x148982CB0] for
+ * 10 s. lock20 is [ptr+0x20] only when ptr is non-null. Reads only.
+ * Does not call AcquireSRWLockExclusive or any game function. */
+static DWORD WINAPI read_cam(LPVOID unused)
+{
+ FILE *fp;
+ int i;
+ int waited = 0;
+ unsigned long long module = 0;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IOFBF, 8192);
+
+ fprintf(fp,
+ "read-cam start hz=%d samples=%d gate=GameModule@0x8983150 "
+ "qword=0x8982CB0 read-only no-call\n",
+ SLOT_HZ, CAM_SAMPLES);
+
+ while (!g_stop && waited < SLOT_WAIT_TICKS) {
+ module = rd64(exe_base() + RVA_GAME_MODULE);
+ if (module) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+ if (!module) {
+ fprintf(fp,
+ "read-cam timeout gate=GameModule@0x8983150 waited_s=%d "
+ "cam ptr=0x0 lock20=0x0 faults=%ld\n",
+ waited / SLOT_HZ, g_faults);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ for (i = 0; i < CAM_SAMPLES && !g_stop; i++) {
+ unsigned long long base = exe_base();
+ unsigned long long ptr = 0;
+ unsigned long long lock20 = 0;
+ LONG faults_before = g_faults;
+ ptr = rd64(base + RVA_CTOR_SCENE);
+ if (ptr)
+ lock20 = rd64(ptr + OFF_CAM_LOCK);
+ if (g_faults != faults_before) {
+ fprintf(fp,
+ "cam fault sample=%d ptr=0x%llX lock20=0x%llX\n",
+ i, ptr, lock20);
+ } else {
+ fprintf(fp, "cam ptr=0x%llX lock20=0x%llX\n", ptr, lock20);
+ }
+ fflush(fp);
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp, "read-cam stop samples=%d faults=%ld\n", i, g_faults);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+}
+
 static DWORD WINAPI logger(LPVOID unused)
 {
  FILE *fp;
@@ -347,6 +421,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  if (mode == 1) entry = spawn_once;
  else if (mode == 2) entry = read_slot;
  else if (mode == 3) entry = add_player;
+ else if (mode == 4) entry = read_cam;
  thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {

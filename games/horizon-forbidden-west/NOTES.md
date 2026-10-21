@@ -1,15 +1,19 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, ADD-PLAYER BLOCKED** (2026-10-21) — `--add-player`
-does not call `FUN_1401e6100`, `FUN_140d73270`, or the player-list
-insert. `FUN_140d73270` at RVA `0xD733C2` loads `[0x148982CB0]` into
-`RDI` and the next call at `0xD733D3` is `AcquireSRWLockExclusive` on
-`RDI+0x20`, with no null test. That qword is its own BSS global, not
-a field of `PlayerManager`. `FUN_140d5e2c0` publishes a
-`CameraPredictionManager*` there at startup and `FUN_140d60010`
-clears it. The live value after a save load was not read. `--spawn-once`
-still does not call `FUN_14134c950`. `--read-slot` is unchanged. Claim
-issue: cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
+Status: **phase 5, READ-CAM READY** (2026-10-21) — `--read-cam` is
+opt-in and read-only. It waits until `GameModule*` at `0x148983150`
+is non-null (same gate as `--read-slot`), then samples the qword at
+`0x148982CB0` for 10 s at 2 Hz and logs `cam ptr=0x.. lock20=0x..`.
+`lock20` is the first qword at `[ptr+0x20]` only when `ptr` is
+non-null, inside SEH. It does not call `AcquireSRWLockExclusive`,
+`FUN_140d73270`, `FUN_14134c950`, or `FUN_1413d8470`, and it writes
+nothing. A line with `ptr` not 0 means the manager is alive. The live
+value after a save load has not been read yet; this flag is that
+read. `--add-player` still does not call `FUN_1401e6100`,
+`FUN_140d73270`, or the player-list insert. `--spawn-once` still does
+not call `FUN_14134c950`. `--read-slot` is unchanged. Default is still
+the 45 s sampler. Claim issue: cranebeaker/coop-anything#83. See
+[DECISION.md](DECISION.md).
 
 The BSS qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
@@ -1554,8 +1558,32 @@ is non-null after a save load was not read from a process this
 session; the static evidence says the startup store fills it and only
 the shutdown virtual clears it.
 
-The constructor is still not called. A future probe only reads
-`[0x148982CB0]` after a save load and skips the call while it is null.
+The constructor is still not called. `--read-cam` is the read that
+was missing: mode byte 4, same `GameModule*` gate as `--read-slot`,
+then 10 s at 2 Hz of `cam ptr=0x.. lock20=0x..`. `ptr` is
+`[0x148982CB0]`. `lock20` is `[ptr+0x20]` only when `ptr` is
+non-null, inside SEH, so a live manager shows the SRWLOCK was
+initialized without calling `AcquireSRWLockExclusive`. A line with
+`ptr` not 0 is the manager alive. It calls no game function and
+writes nothing. `--add-player` stays the blocked log.
+`--spawn-once` and `--read-slot` are unchanged.
+
+After a save load, from `probe\bin\Release\net10.0` (the shell
+returns immediately; the log is `M:\Horizon Forbidden West\hfw-probe.log`;
+if that file is missing, read `hfw-probe-run.txt` beside the exe):
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--read-cam'
+```
+
+This only reads. No hitch expected. Alt-f4 first only if a previous
+probe DLL is still wedged in the game; otherwise it can run on the
+current session. The loader still prefers `hfw_probe_new.dll` when
+that file sits beside a mapped `hfw_probe.dll`.
+
+Selftest is 27/27 on the offline exe. The new anchor is the publish
+store (`48 89 1D 90 32 C2 07` at `0xD5FA19`). The constructor load
+(`48 8B 3D E7 F8 C0 07` at `0xD733C2`) was already checked.
 
 ## Sources
 
