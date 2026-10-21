@@ -1,6 +1,10 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, SECOND ENTITY FOUND, NOT CALLED** (2026-10-21) —
+Status: **phase 5, ENTITY ALLOC ONE-SHOT BUILT, NOT RUN** (2026-10-21) —
+`--alloc-entity` calls the four inner steps of `FUN_1401f82b0` once
+and stops. It does not call the factory itself: `RCX` is a parent
+container the probe cannot name. It does not call `FUN_1401f96d0`,
+so the new block is not pushed onto any vector the game walks.
 `--add-player` is unchanged and still stops after `FUN_1401e6100(0x210)`.
 It does not call `FUN_140d73270` and it does not call `FUN_1402250c0`,
 so it does not insert into the player list and it does not publish the
@@ -1906,6 +1910,99 @@ and a container that is not the camera manager and not the player
 list, then returns the new block. It stops before `FUN_140d73270`.
 The record is data, not a guessed address: tag `0x04`, size `0x300`,
 ctor `FUN_1411a0980`. Calling the factory was not done this session.
+
+### `--alloc-entity` (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only. HEAD `00d2243` verified. No inject, no launch, nothing
+written under `M:\`. Two `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/FactoryCall.java`,
+`local/ghidra_scripts/FactoryInner.java`, reports
+`local/factory_call.txt` and `local/factory_inner.txt`). No
+re-analysis, no symbol-table scan.
+
+The factory is not callable from the probe. `FUN_1401f82b0` takes two
+arguments, and neither is the type record. The prologue reads the
+parent first:
+
+```
+RVA 0x1F82CC MOV RAX, [RCX+0x58]
+RVA 0x1F82D0 MOV R12, RDX
+RVA 0x1F82D3 MOVSXD R8, dword ptr [RCX+0x50]
+RVA 0x1F82E2 MOV R13, RCX
+```
+
+`RCX` is a container. The record the factory constructs comes off that
+container's own stack, `[[RCX+0x58] + [RCX+0x50]*0x20 - 0x18]`, and
+`RDX` is a second value from the same stack. The only real caller,
+`FUN_1401f7bd0`, sets it up like this:
+
+```
+RVA 0x1F8012 LEA RBX, [RDI-0x20]
+RVA 0x1F8048 MOV RDX, RSI
+RVA 0x1F804B MOV RCX, RBX
+RVA 0x1F804E CALL 0x1401f82b0
+```
+
+The other two sites (`FUN_1401f8d40` at `0x1F8E29`, `FUN_1401f90a0` at
+`0x1F92FB`) do the same shape: `RCX` is the caller's own frame plus
+`-0x20`, `RDX` is a value that frame already holds. A parent we cannot
+name is not passed, so the factory is not called. There is no
+`alloc-entity blocked` line, because the four inner steps below are
+fully known and those are what runs.
+
+What happens to the block if you return before `FUN_1401f96d0`. The
+push is not optional inside the factory: after the placement call the
+factory always calls `FUN_1401f96d0(param_1+0x50, &local_128)`, and
+that function's first argument is the caller's vector
+(`[RCX]` count, `[RCX+4]` capacity, `[RCX+8]` storage, 0x20-byte
+elements). There is no path that returns the pointer without pushing
+it. So the factory is not called with a vector of ours either.
+
+The four inner steps, done by hand instead. Each takes the record in
+`RCX` and nothing else:
+
+```
+FUN_1402033d0 tag 4 -> [record+0x18] the constructor
+FUN_1402032d0 tag 4 -> [record+0x10] the size, 0x300
+FUN_1401e6100(size) -> the block
+FUN_1411a0980(RCX=record, RDX=block)
+```
+
+`FUN_1411a0980` ignores its first argument, moves `RDX` into `RCX` and
+calls `FUN_140948a10`, then writes `ControlledEntity::vftable` at `+0`,
+`+0x20` and `+0x30`. The factory's own fifth call, at `0x1F85FC`, is
+not one of these four: it calls a function pointer `FUN_1401feb90`
+returned into `[RBP-0x58]`, with `RCX = [RBP-0x68] + R14`, and `R14`
+is the previous stack entry of the same parent. That one is not
+called. `FUN_1401f96d0` is not called. The block is not inserted
+anywhere, so the game has no pointer to it and never walks it.
+
+`--alloc-entity` waits until `GameModule*` at `0x148983150` is
+non-null, runs those four calls once inside SEH, logs the pointer and
+its first qword, and returns. It does not pass the owner's entity. It
+does not call `FUN_140d73270`, `FUN_14134c950`, `FUN_1413d8470`,
+`FUN_14101bd70`, `FUN_1402250c0` or `FUN_1400fe310`, and it does not
+write `entity+0xD8`. `--add-player`, `--read-slot`, `--read-cam` and
+`--spawn-once` are unchanged.
+
+Start a fresh session and load a save first. This does not spawn a
+visible character and does not touch the owner's player. A hitch is
+unlikely, but alt-f4 if the game wedges. From
+`probe\bin\Release\net10.0`:
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--alloc-entity'
+```
+
+The line to look for is `alloc-entity stop ptr=0x` with a non-zero
+pointer, then `vtable=0x` and `size=0x300`. The pointer is the whole
+result. Do not expect a character on screen.
+
+Selftest is 40/40 on the offline exe, including the factory prologue
+(`48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57` at `0x1F82B0`), the
+record's size dword (`FF FF FF FF 04 .. 00 03 00 00` at `0x21DA6C0`,
+file offset `0x21D9AC0`) and the constructor slot
+(`80 09 1A 41 01 00 00 00` at `0x21DA6D8`).
 
 ## Sources
 

@@ -46,6 +46,27 @@
 // writes nothing. A line with ptr non-null means the manager is alive.
 // Default, --read-slot, --spawn-once and --add-player are unchanged.
 //
+// --alloc-entity: opt-in. Mode byte 5. One shot, then the thread exits.
+// It does not call FUN_1401f82b0. That factory takes a live parent
+// container in RCX (the first instruction that reads an argument is
+// MOV RAX,[RCX+0x58] at RVA 0x1F82CC) and the only real caller,
+// FUN_1401f7bd0 at RVA 0x1F8048, passes MOV RCX,RBX where RBX was set
+// by LEA RBX,[RDI-0x20] at 0x1F8012. The type
+// record is not a register of the factory; it sits on that parent's
+// stack. The probe cannot name that parent, so the factory is not
+// called and no vector is passed. Instead, once GameModule* at RVA
+// 0x8983150 is non-null, the thread runs the four inner steps once,
+// inside SEH, with the ControlledEntity record at RVA 0x21DA6C0:
+// FUN_1402033d0(record), FUN_1402032d0(record), FUN_1401e6100(size),
+// FUN_1411a0980(record, block). It does not call FUN_1401f96d0, so
+// the block is not pushed onto any vector the game walks. It does
+// not call FUN_140d73270, FUN_14134c950, FUN_1413d8470, FUN_14101bd70,
+// FUN_1402250c0 or FUN_1400fe310, and it does not write entity+0xD8.
+// The line to look for is
+// "alloc-entity stop ptr=0x.. vtable=0x.. size=0x300".
+// This does not spawn a visible character and does not touch the
+// owner's player. The pointer in the log is the whole result.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -134,14 +155,17 @@ internal static class Program
  var readSlot = HasFlag(args, "--read-slot");
  var addPlayer = HasFlag(args, "--add-player");
  var readCam = HasFlag(args, "--read-cam");
+ var allocEntity = HasFlag(args, "--alloc-entity");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
  Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
  Note(addPlayer ? "add-player flag seen" : "add-player flag absent");
  Note(readCam ? "read-cam flag seen" : "read-cam flag absent");
- var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0) + (readCam ? 1 : 0);
+ Note(allocEntity ? "alloc-entity flag seen" : "alloc-entity flag absent");
+ var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0)
+ + (readCam ? 1 : 0) + (allocEntity ? 1 : 0);
  if (modes > 1)
  {
- Note("REFUSED: --spawn-once, --read-slot, --add-player and --read-cam are mutually exclusive.");
+ Note("REFUSED: --spawn-once, --read-slot, --add-player, --read-cam and --alloc-entity are mutually exclusive.");
  return 2;
  }
 
@@ -185,8 +209,8 @@ internal static class Program
  // the block and does not call FUN_14134c950. --read-slot injects a
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
- // 2 read-slot, 3 add-player (one shot), 4 read-cam.
- var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : 0)));
+ // 2 read-slot, 3 add-player (one shot), 4 read-cam, 5 alloc-entity.
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : (allocEntity ? 5 : 0))));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
@@ -198,6 +222,7 @@ internal static class Program
  : mode == 2 ? "injected mode=read-slot"
  : mode == 3 ? "injected mode=add-player"
  : mode == 4 ? "injected mode=read-cam"
+ : mode == 5 ? "injected mode=alloc-entity"
  : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
@@ -238,6 +263,21 @@ internal static class Program
  "log is hfw-probe.log in the game's working directory. " +
  "a live manager is a line 'cam ptr=0x.. lock20=0x..' with ptr not 0. " +
  "samples 10s at 2 Hz after GameModule@0x8983150 is non-null.");
+ return 0;
+ }
+ if (allocEntity)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=alloc-entity. " +
+ "one shot: the four inner steps, then exit. FUN_1401f82b0 is not called " +
+ "(its RCX is a parent container this probe cannot name). " +
+ "FUN_1401f96d0 is not called, so the block is not inserted anywhere. " +
+ "FUN_140d73270, FUN_14134c950, FUN_1413d8470, FUN_14101bd70, FUN_1402250c0 " +
+ "and FUN_1400fe310 are not called. entity+0xD8 is not written. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ "start a fresh session, load a save first. " +
+ "the line to look for is 'alloc-entity stop ptr=0x' with a non-zero pointer. " +
+ "this does not spawn a visible character and does not touch the player's entity. " +
+ "the pointer in the log is the whole result. a hitch is unlikely; alt-f4 if wedged.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -304,7 +344,8 @@ internal static class Program
  // One byte in front of the wide path. The DLL reads it back from its
  // own file (the loader's copy, not the game directory) to decide
  // which thread to start. The remote thread is still LoadLibraryW.
- // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam.
+ // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam,
+ // 5 alloc-entity (four inner steps, factory not called).
  File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
@@ -498,6 +539,22 @@ internal static class Program
  // [0x148983150] is the instruction before MOV RBX,RDX.
  ("gamemodule +0x50 load", 0xD6306F, "48 8B 3D DA 00 C2 07"),
  ("gamemodule +0x50 store", 0xD63090, "48 89 5F 50"),
+ // FUN_1401f82b0 prologue. --alloc-entity does not call this entry:
+ // RCX is a parent container, and the first argument read is
+ // MOV RAX,[RCX+0x58]. The only real caller passes MOV RCX,RBX
+ // at 0x1F8048, and that RBX came from LEA RBX,[RDI-0x20] at 0x1F8012.
+ ("factory FUN_1401f82b0", 0x1F82B0, "48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57"),
+ ("factory reads RCX+0x58", 0x1F82CC, "48 8B 41 58"),
+ ("factory caller RCX", 0x1F8048, "48 8B D6 48 8B CB"),
+ // The four steps, in the order the factory itself runs them.
+ ("ctor-from-record FUN_1402033d0", 0x2033D0, "0F B6 41 04 83 F8 07 77 33"),
+ ("size-from-record FUN_1402032d0", 0x2032D0, "0F B6 41 04 83 F8 07 77 37"),
+ ("place FUN_1411a0980", 0x11A0980, "48 85 D2 74 35 53 48 83 EC 20"),
+ // ControlledEntity record. File offset is 0x21D9AC0 (RVA 0x21DA6C0).
+ // Tag byte +0x4 is 0x04. The size dword at +0x10 is 0x300. The
+ // constructor qword at +0x18 is 0x1411A0980, FUN_1411a0980.
+ ("record tag+size", 0x21DA6C0, "FF FF FF FF 04 00 01 00 00 00 FF 00 00 00 00 00 00 03 00 00"),
+ ("record ctor slot", 0x21DA6D8, "80 09 1A 41 01 00 00 00"),
  };
 
  var pe = File.ReadAllBytes(exe);

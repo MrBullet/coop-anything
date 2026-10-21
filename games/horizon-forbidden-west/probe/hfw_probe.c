@@ -49,6 +49,22 @@
  * not call AcquireSRWLockExclusive, FUN_140d73270, FUN_14134c950, or
  * FUN_1413d8470. It writes nothing.
  *
+ * --alloc-entity (opt-in, mode byte 5): one shot, then exit. Does NOT
+ * call FUN_1401f82b0. That factory's first argument is a live parent
+ * container (RCX at 0x1F82CC loads [RCX+0x58], and the only real caller
+ * FUN_1401f7bd0 at 0x1F8048 passes MOV RCX,RBX (RBX was
+ * LEA RBX,[RDI-0x20] at 0x1F8012). The type record
+ * is not a register argument of the factory; it is popped off that
+ * parent's stack. A parent we cannot name is not passed. The four
+ * inner steps are called instead, once, inside SEH:
+ *   ctor = FUN_1402033d0(record)        ; case 4 returns [record+0x18]
+ *   size = FUN_1402032d0(record)        ; case 4 returns [record+0x10]
+ *   block = FUN_1401e6100(size)         ; 0x300 for this record
+ *   FUN_1411a0980(record, block)        ; RCX record, RDX block
+ * The block is not pushed. FUN_1401f96d0 is not called, and neither is
+ * the second call the factory makes at 0x1F85FC. The pointer is logged
+ * and the thread returns. The game never walks the block.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -116,6 +132,14 @@
 #define PLAYER_GAME_SIZE 0x210
 #define ADD_WAIT_TICKS 120 /* 60 s at 2 Hz */
 
+/* ControlledEntity type record. Tag byte at +0x4 is 0x04, so
+ * FUN_1402032d0 returns the dword at +0x10 (0x300) and FUN_1402033d0
+ * returns the qword at +0x18 (FUN_1411a0980). */
+#define RVA_ENTITY_RECORD 0x21DA6C0ull
+#define RVA_CTOR_FROM_RECORD 0x2033D0ull
+#define RVA_SIZE_FROM_RECORD 0x2032D0ull
+#define RVA_PLACE_CONTROLLED 0x11A0980ull
+
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
 
@@ -179,6 +203,83 @@ static DWORD WINAPI spawn_once(LPVOID unused)
 }
 
 typedef unsigned long long (__fastcall *alloc_fn)(unsigned long long size);
+typedef unsigned long long (__fastcall *record_fn)(unsigned long long record);
+typedef void (__fastcall *place_fn)(unsigned long long record, unsigned long long block);
+
+/* One shot. Four inner steps of FUN_1401f82b0, not the factory.
+ * The factory is not called: its RCX is a parent container the probe
+ * cannot name (see the comment at the top). The block is not inserted
+ * anywhere. FUN_1401f96d0 is not called, so the game has no pointer to
+ * the block and never walks it. */
+static DWORD WINAPI alloc_entity(LPVOID unused)
+{
+ FILE *fp;
+ int waited = 0;
+ unsigned long long base;
+ unsigned long long module = 0;
+ unsigned long long record;
+ unsigned long long ctor = 0;
+ unsigned int size = 0;
+ unsigned long long block = 0;
+ unsigned long long vtable = 0;
+ unsigned int seh = 0;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IONBF, 0);
+
+ fprintf(fp,
+ "alloc-entity start one-shot gate=GameModule@0x8983150 "
+ "steps=ctor-from-record,size-from-record,alloc,place "
+ "record=0x21DA6C0 factory-not-called\n");
+
+ while (!g_stop && waited < SLOT_WAIT_TICKS) {
+ module = rd64(exe_base() + RVA_GAME_MODULE);
+ if (module) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp,
+ "alloc-entity gate module=0x%llX waited_s=%d faults=%ld\n",
+ module, waited / SLOT_HZ, g_faults);
+
+ if (!module) {
+ fprintf(fp,
+ "alloc-entity timeout. FUN_1402033d0, FUN_1402032d0, "
+ "FUN_1401e6100 and FUN_1411a0980 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ base = exe_base();
+ record = base + RVA_ENTITY_RECORD;
+ __try {
+ record_fn ctor_from = (record_fn)(base + RVA_CTOR_FROM_RECORD);
+ record_fn size_from = (record_fn)(base + RVA_SIZE_FROM_RECORD);
+ alloc_fn alloc = (alloc_fn)(base + RVA_ALLOC);
+ place_fn place = (place_fn)(base + RVA_PLACE_CONTROLLED);
+ ctor = ctor_from(record);
+ size = (unsigned int)size_from(record);
+ block = alloc((unsigned long long)size);
+ if (block) place(record, block);
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ if (block && !seh) vtable = rd64(block);
+
+ fprintf(fp,
+ "alloc-entity stop ptr=0x%llX vtable=0x%llX size=0x%X "
+ "ctor=0x%llX seh=0x%08X (factory not called, not inserted)\n",
+ block, vtable, size, ctor, seh);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+}
 
 /* One shot. Alloc only. The constructor publishes the block onto the
  * camera manager with the owner's entity at +0x30, and the list insert
@@ -503,6 +604,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  else if (mode == 2) entry = read_slot;
  else if (mode == 3) entry = add_player;
  else if (mode == 4) entry = read_cam;
+ else if (mode == 5) entry = alloc_entity;
  thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {
