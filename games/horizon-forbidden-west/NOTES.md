@@ -5,9 +5,10 @@ qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
 stores a `NetErrorHandlerGame*` built at startup, and `+0xF8` on that
 object is a `StateInGame*` whose `+0x108` is zeroed in the same
-constructor. A second `PlayerGame` still needs
-`[[0x148983150]+0x50]+0x20`, which the probe thread does not have.
-`--spawn-once` does not call `FUN_14134c950`. Claim issue:
+constructor. The other pointer the spawn path loads,
+`[[0x148983150]+0x50]`, is written by `MOV [RDI+0x50], RBX` at RVA
+`0xD63090` in `FUN_140d63060` while `GameModuleStateLoading` runs.
+`--spawn-once` still does not call `FUN_14134c950`. Claim issue:
 cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 ## Game identity (observed, verified this session)
@@ -1060,19 +1061,108 @@ that object was not found as a store in the publish function, so the
 entity pointer is not named beyond that load. Do not re-enable
 `FUN_14134c950`. Do not emit `FUN_140d8c2d0`.
 
+### Who writes `+0x50` on the object at `0x148983150` (2026-10-21)
+
+Offline only. Capstone 5.0.7 on the workspace exe (SHA-256 unchanged)
+plus one Ghidra `-noanalysis -process` pass (`local/ghidra_scripts/Plus50.java`,
+report `local/plus50.txt`) for function bounds and xrefs. No re-analysis,
+no inject, no launch, nothing written under `M:\`. `--spawn-once` was
+not rebuilt into a call. The probe selftest gained two byte anchors
+(`48 8B 3D DA 00 C2 07` at `0xD6306F`, `48 89 5F 50` at `0xD63090`)
+and was run offline against the workspace exe: 23/23, `SELFTEST OK`.
+The game was not launched.
+
+The publish function is `FUN_140d5e2c0` (`0xD5E2C0`, 6903 bytes). Its
+only code reference is a slot, not a call: `GameModule::vftable+0x20`
+(vtable RVA `0x18FB8B0`, `.?AVGameModule@@`, COL `0x1A838A0`). `RCX`
+is copied to `RDI` at `0xD5E2E5` and `RDI` is not assigned again before
+the publish, so the stored pointer is that `GameModule*`. The publish
+itself is `48 89 3D E1 49 C2 07` at `0xD5E768`, `MOV [RIP+0x7C249E1], RDI`,
+and `0xD5E76F + 0x7C249E1 = 0x8983150`.
+
+Stores this function makes into that object (base `RCX` before the copy,
+base `RDI` after it):
+
+| RVA | bytes | store |
+|---|---|---|
+| `0xD5E2E8` | `44 89 B1 74 06 00 00` | `[this+0x674] = 0` |
+| `0xD5E301` | `48 89 91 90 04 00 00` | `[this+0x490] = [[0x1489581C8]+0x30]` |
+| `0xD5E529` | `C5 F8 11 87 80 04 00 00` | `[this+0x480] = xmm0` |
+| `0xD5E728` | `48 89 8F 78 04 00 00` | `[this+0x478] = RCX` (the `GameModuleState` built at `0xD5E6B0`, vtable `0x18FB998`) |
+| `0xD5E741` | `C7 87 74 06 00 00 03 00 00 00` | `[this+0x674] = 3` |
+| `0xD5EB0C` | `48 89 9F 70 02 00 00` | `[this+0x270] = RBX` |
+| `0xD5EFA1` | `48 89 9F 80 01 00 00` | `[this+0x180] = RBX` |
+| `0xD5F00F` | `48 89 87 58 05 00 00` | `[this+0x558] = RAX` |
+| `0xD5F11A` | `48 89 87 88 01 00 00` | `[this+0x188] = RAX` |
+| `0xD5F6AA` | `48 89 5F 60` | `[this+0x60] = RBX` |
+| `0xD5F815` | `48 89 87 60 02 00 00` | `[this+0x260] = RAX` |
+| `0xD5F8D4` | `48 89 87 98 01 00 00` | `[this+0x198] = RAX` |
+| `0xD5F92D` | `48 89 9F A0 01 00 00` | `[this+0x1A0] = RBX` |
+| `0xD5F94C` | `48 89 87 E8 01 00 00` | `[this+0x1E8] = RAX` |
+| `0xD5F96A` | `48 89 87 D0 01 00 00` | `[this+0x1D0] = RAX` |
+| `0xD5FBC7` | `48 89 9F 68 02 00 00` | `[this+0x268] = RBX` |
+| `0xD5FD1C` | `48 89 9F 78 02 00 00` | `[this+0x278] = RBX` |
+| `0xD5FD23` | `C6 87 70 06 00 00 00` | `[this+0x670] = 0` |
+| `0xD5FD2A` | `C7 87 74 06 00 00 01 00 00 00` | `[this+0x674] = 1` |
+
+`+0x50` is not in that list. The `MOV [RAX+0x50], R14` at `0xD5E671`
+(`4C 89 70 50`) writes the `PlayerManagerGame` allocated at `0xD5E628`
+(vtable `0x18FBE60` stored at `0xD5E67D`), which is published to the
+other global `0x148982C80` at `0xD5E68B`. That is a different object.
+
+Writers of `[reg+0x50]` were then required to load `0x148983150` in the
+same function and to keep that register (or a `MOV` copy of it) as the
+store base. 994 `REX.W MOV r64, [0x148983150]` sites, one hit:
+
+```
+FUN_140d63060
+RVA 0xD6306F  48 8B 3D DA 00 C2 07  MOV RDI, [0x148983150]
+RVA 0xD63076  48 8B DA              MOV RBX, RDX
+RVA 0xD63090  48 89 5F 50           MOV [RDI+0x50], RBX
+```
+
+`RDI` is not written between the load and the store. The previous value
+is released first (`MOV RCX, [RDI+0x50]` at `0xD63082`, `CALL 0x1402084c0`
+at `0xD6308B` when it is non-null). `RDX` is refcounted at `[RDX+0x18]`
+(`F0 FF 42 18` at `0xD6307E`) before it is stored. One direct caller,
+`FUN_14134bf40` at `0x134BFEC`. That function's `RDX` is the unwrapped
+object from `[[[0x148983150]+0x490]+0x88]`, taken at `0x134BF90` as
+`[entity+0x20]` when the handle tag at bit 60 is set, otherwise from
+`[that+0xE8]` / `[that+0xE0]` by the same unwrap (`0x134BFE3`). No RTTI
+name was recovered for that object: no constructor both writes a vtable
+and writes the `float` at `+0x198` which `FUN_140d63060` reads back at
+`0xD630A8`. It is a refcounted Decima object reached through the
+`GameModule+0x490` handle, not a typed player record.
+
+When it runs. `FUN_14134bf40` has no direct `CALL`. Its one code xref is
+the tail `JMP` at `0x134BCD6` inside `FUN_14134bbc0`, whose one code xref
+is the `JMP` at `0x134BB29` inside `FUN_14134bac0`. `FUN_14134bac0` has no
+`CALL` either. Its slot is `GameModuleStateLoading::vftable+0x30` (vtable
+RVA `0x18FB5A0`, `.?AVGameModuleStateLoading@@`). That vtable is written
+once, at `0xD5F98C`, inside the same `FUN_140d5e2c0`, onto the state
+object then stored at `[GameModule+0x1D0]`. So the `+0x50` store runs when
+that loading-state virtual runs, which is after startup has published the
+`GameModule`, not per frame and not inside the publish function. The
+`float`/`dword` it copies (`+0x198`, `+0x19c`, `+0x1A0`) are only
+available once that object exists; a freshly published `GameModule` does
+not have `+0x50` filled by `FUN_140d5e2c0`.
+
+`+0x50` holds that refcounted object. The entity pointer the spawn path
+wants is still one field further, `[that+0x20]`, which `FUN_14134c950`
+loads at `0x134C9FE`. This session did not read it from a live process.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised: do not call `FUN_14134c950` from any thread.
- The entity argument of `FUN_140d73270` is
- `[[0x148983150]+0x50]+0x20`, and `+0x50` of the object published at
- `0xD5E768` has no store in that function. Next milestone is to name
- the instruction that writes that `+0x50` field (function, RVA, when
- it runs). Only after that field is a known live object is an insert
- of a `PlayerGame` worth writing, and it is still not this session.
- Do not write the double3. Do not call `FUN_14101bd70`. Do not store
- to `entity+0xD8`.
+- Milestone 2, revised again: the `+0x50` store is named
+ (`FUN_140d63060` at `0xD63090`, `48 89 5F 50`, during
+ `GameModuleStateLoading`). Do not call `FUN_14134c950`. The next
+ probe, still not a spawn, is to read `[[0x148983150]+0x50]` after a
+ save has loaded and record whether it is non-null. The entity
+ argument remains `[that+0x20]`. Do not write the double3. Do not
+ call `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
+ `FUN_140d8c2d0`.
 
 ## Sources
 

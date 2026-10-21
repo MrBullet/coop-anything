@@ -380,6 +380,10 @@ internal static class Program
  ("spawn alloc size", 0x21615A0, "10 02 00 00"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
+ // FUN_140d63060 writes the published GameModule's +0x50. The load of
+ // [0x148983150] is the instruction before MOV RBX,RDX.
+ ("gamemodule +0x50 load", 0xD6306F, "48 8B 3D DA 00 C2 07"),
+ ("gamemodule +0x50 store", 0xD63090, "48 89 5F 50"),
  };
 
  var pe = File.ReadAllBytes(exe);
