@@ -2881,6 +2881,123 @@ before they build the `0x18` record. Do not decompile those until
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140a9b780` dispatches a `MsgScene`, not an entity (2026-10-21)
+
+Offline only. Four `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/JobRdx.java`, `JobRdx2.java`, `JobRdx3.java`,
+`JobRdx4.java`; reports `local/job_rdx.txt`, `local/job_rdx2.txt`,
+`local/job_rdx3.txt`, `local/job_rdx4.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. `RDX` is not an `Entity*`, so no call frame was
+emitted.
+
+`FUN_140a9b780` is 207 bytes and returns void. The three arguments
+are saved at the entry and never written back:
+
+```
+RVA 0xA9B78F MOV RSI,R8
+RVA 0xA9B792 MOV RBX,RDX
+RVA 0xA9B795 MOV RDI,RCX
+```
+
+`RCX` is the job object (the drain passes `RBP`, its own `this`).
+`RDX` is the first qword of the `0x18`-byte record. `R8` is
+`record+8`, the other 16 bytes, and it is only forwarded.
+
+The virtual call at `0xA9B7AC` is slot 0 of `RDX`, and its return is
+a type record, not the object:
+
+```
+RVA 0xA9B7A6 MOV RAX,qword ptr [RBX]
+RVA 0xA9B7A9 MOV RCX,RBX
+RVA 0xA9B7AC CALL qword ptr [RAX]
+RVA 0xA9B7AE MOV R9,RAX
+RVA 0xA9B7D4 LEA RCX,[0x142121e40]
+RVA 0xA9B7DB CMP R9,RCX
+```
+
+`RAX` is compared with the record at RVA `0x2121E40`, including a
+walk of `[R9+0x58]` when the tags match. That record has the same
+header shape as `ControlledEntity` at `0x21DA6C0` (tag `+4` is
+`0x04`, one base at `+0x58`, no property rows). Its name qword, at
+the same `+0x40` slot that reads `ControlledEntity` on the entity
+record, reads `MsgScene`. The base at `+0x58` names `MsgBase`. So
+`RDX` is a `MsgScene*`. It is not an `Entity*`, not a type record
+(the call *returns* the type record), and not the job (that is
+`RCX`).
+
+The only other call is at `0xA9B83D`, and only when the type check
+passes, `[RCX+0x2e0]` is non-null, and `[RDX+0x10]` is non-zero:
+
+```
+RVA 0xA9B81F MOV RCX,qword ptr [RDI + 0x2e0]
+RVA 0xA9B82B CMP byte ptr [RBX + 0x10],0x0
+RVA 0xA9B837 MOV R8,RSI
+RVA 0xA9B83A MOV RDX,RBX
+RVA 0xA9B83D CALL qword ptr [RAX]
+```
+
+That is a virtual call on the pointer already stored in the job.
+Nothing in the 207 bytes writes a pointer into a counted array, a
+parent slot, or a model slot. The earlier `CALL 0x140a9f0d0` at
+`0xA9B798` only walks two lists the job already owns (`+0x1f0` /
+`+0x1f8` and `+0x1e8`) and forwards `RDX`.
+
+Who queues it. `FUN_140a9b480` reads the record at `0xA9B540`
+(`MOV RDX, [RDI]`) and calls this function at `0xA9B54A`. The store
+is in `FUN_140a9b340`, one record of `0x18` bytes:
+
+```
+RVA 0xA9B34C MOV RBP,RCX ; the job
+RVA 0xA9B353 MOV RSI,R8 ; the 16-byte payload
+RVA 0xA9B35A MOV RDI,RDX ; the first qword
+RVA 0xA9B439 VMOVUPS xmmword ptr [RDX + RCX*0x8],XMM0
+RVA 0xA9B43E VMOVHPD qword ptr [RDX + RCX*0x8 + 0x10],XMM1
+```
+
+`XMM0` was built from `RDI` then the 16 bytes of `R8`, so the first
+qword of the record is the `RDX` the caller of `FUN_140a9b340`
+passed. One such caller is enough. `FUN_140a9f910` at `0xA9F9EC`:
+
+```
+RVA 0xA9F935 MOV R14,RDX ; the caller's message
+RVA 0xA9F9C1 MOV RAX,qword ptr [R14]
+RVA 0xA9F9C4 MOV RCX,R14
+RVA 0xA9F9C7 CALL qword ptr [RAX] ; same slot 0, the type record
+RVA 0xA9F9CC CALL 0x1402034a0 ; allocate from that record
+RVA 0xA9F9D1 MOV RDX,R14
+RVA 0xA9F9D7 MOV RBX,RAX
+RVA 0xA9F9DD CALL qword ptr [R8 + 0x10] ; copy the message
+RVA 0xA9F9E6 MOV RDX,RBX
+RVA 0xA9F9EC CALL 0x140a9b340
+```
+
+`FUN_1402034a0` (180 bytes) reads the record the same way the entity
+factory does: constructor from `FUN_1402033d0`, size from
+`FUN_1402032d0`, block from `FUN_1401e6100`, then the placement
+constructor. For `MsgScene` the size dword at `+0x10` is `0x18`. The
+first qword of the job record is that fresh `MsgScene*`, a copy of
+the message the caller already had. It is not the entity recovered
+by `LEA RBP, [RAX-0x20]` at `0xA9F938`.
+
+Miss. No instruction in `FUN_140a9b780` registers an entity. The
+`MsgScene` record has no constructor pointer at `+0x18` (that qword
+is 0), and the four functions that touch this message
+(`FUN_140a9b780`, `FUN_140a9f910`, `FUN_140aa4180`, `FUN_14095fcb0`)
+do not reference `EntityManagerGame*` (`0x8982C40`), `GameModule*`
+(`0x8983150`), `SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*`
+(`0x8982C80`). An allocated `ControlledEntity` does not fill `RDX`.
+
+The single next decompile is `FUN_140aa4180` (292 bytes), called at
+`0xA9F954` as `(RCX = the return of FUN_14095fcb0(entity), RDX = the
+job)`. The question is whether that call inserts the entity it was
+given into a manager we already hold, or only forwards the
+`MsgScene`. No call until that is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
