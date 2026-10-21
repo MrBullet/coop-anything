@@ -4,11 +4,14 @@
 // own thread. It never writes game memory, never hooks Present, and never
 // calls a game function.
 //
-// --spawn-once: the DLL waits until the player-list count is at least 1,
-// calls FUN_14134c950 once, logs the count again, and exits. It does not
-// write the entity double3. The loader writes one byte next to the DLL
-// (hfw_probe.dll.mode, not the game directory). The DLL reads that byte
-// from its own module path. Default stays the 45 s sampler.
+// --spawn-once: the DLL does not call FUN_14134c950. One live call
+// raised 0xC0000005 on MOV RCX,[RAX+0xF8] where RAX was loaded from
+// the null global at VA 0x1489581F0 (RVA 0x89581F0). The flag still
+// injects, but the thread only logs "spawn-once blocked" and exits.
+// It does not write the entity double3. The loader writes one byte
+// next to the DLL (hfw_probe.dll.mode, not the game directory). The
+// DLL reads that byte from its own module path. Default stays the
+// 45 s sampler.
 //
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
@@ -127,8 +130,9 @@ internal static class Program
 
  // Strikers' shape: VirtualAllocEx + WriteProcessMemory + CreateRemoteThread,
  // here pointed at LoadLibraryW so hfw_probe.dll runs inside the game.
- // The default DLL only reads. --spawn-once calls FUN_14134c950 once.
- // The mode byte sits next to the DLL, which the game never writes.
+ // The default DLL only reads. --spawn-once injects a DLL that logs
+ // the block and does not call FUN_14134c950. The mode byte sits next
+ // to the DLL, which the game never writes.
  var injected = Inject(proc.Id, Path.GetFullPath(dll), spawnOnce, out var whyNot);
  if (!injected)
  {
@@ -144,8 +148,8 @@ internal static class Program
  if (spawnOnce)
  {
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=spawn-once. " +
- "one call of FUN_14134c950. log is hfw-probe.log in the game's working directory. " +
- "load a save first. alt-f4 if the game stays wedged.");
+ "FUN_14134c950 is not called. log is hfw-probe.log in the game's working directory. " +
+ "expect a line starting with 'spawn-once blocked'. do not expect count=2.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -365,11 +369,13 @@ internal static class Program
  // that pushes into pm+8: LEA RCX,[RSI+8]; MOV [RSP+0x78],RBX;
  // LOCK INC [RBX+0x18]; LEA RDX,[RSP+0x78]; CALL FUN_1402250c0.
  ("player-list insert pm+8", 0xD8C381, "48 8D 4E 08 48 89 5C 24 78 F0 FF 43 18 48 8D 54 24 78 E8 28 8D 49 FF"),
- // FUN_14134c950 prologue: MOV [RSP+0x10],RBX / MOV [RSP+0x18],RSI /
- // MOV [RSP+0x20],RDI / MOV [RSP+8],RCX. The call site in
- // FUN_14134c590 is a bare E8 with no register setup.
+ // FUN_14134c950 prologue still matches, but --spawn-once does not call it.
+ // The faulting reload is MOV RAX,[RIP+disp] at 0x134C9B1 (global
+ // VA 0x1489581F0) then MOV RCX,[RAX+0xF8] at 0x134C9BA with no TEST.
  ("spawn FUN_14134c950", 0x134C950, "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 48"),
  ("spawn call site", 0x134C657, "E8 F4 02 00 00"),
+ ("spawn ctx reload", 0x134C9B1, "48 8B 05 38 B8 60 07"),
+ ("spawn ctx deref +0xF8", 0x134C9BA, "48 8B 88 F8 00 00 00"),
  // size dword the spawn function passes to FUN_1401e6100 (0x210).
  ("spawn alloc size", 0x21615A0, "10 02 00 00"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),

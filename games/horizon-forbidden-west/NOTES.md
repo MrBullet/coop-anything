@@ -909,9 +909,59 @@ spawn-once after called=0 code=0xC0000005 count=1 storage=0x1FF952101E0 delta=0 
 ```
 
 `count` stayed 1. `0xC0000005` is the SEH access violation inside
-`FUN_14134c950`. The call returned. That is not `count=2`. Do not
-treat this as the milestone. The owner should alt-f4 if the game is
-wedged, then rerun the command below on a freshly loaded save.
+`FUN_14134c950`. The call returned. That is not `count=2`. The same
+session then decompiled the caller and the first loads (below). Do not
+rerun the call. Alt-f4 this session first: the access violation ran
+inside the game, so the process is dirty even if it still looks
+playable.
+
+### Why the call faulted (2026-10-21, Ghidra `-noanalysis`)
+
+Copied the game log to `local/hfw-probe-spawn-av.log` (read-only). Same
+three lines as above. No second inject. The game process was left
+running; the old `hfw_probe.dll` stayed mapped, so the rebuilt DLL was
+written after renaming that mapped file aside.
+
+Caller of the bare `E8` at `0x134C657` is the whole of `FUN_14134c590`
+(`0x134C590`, 361 bytes, `void(void)`). It does not put a live object
+in RCX. The spawn call is reached by fall-through when
+`[0x148983278]` is null, and after a few other calls when it is not.
+None of those calls leave RCX set up for `FUN_14134c950`. The saved
+RCX in the spawn prologue is still discarded at `0x134CB4A`.
+
+First pointer the spawn function dereferences:
+
+```
+0x134C979 MOV RAX, [0x1489581F0] ; tested, JZ skips the first virtual
+0x134C9B1 MOV RAX, [0x1489581F0] ; reloaded
+0x134C9BA MOV RCX, [RAX+0xF8] ; no TEST RAX. this is the AV
+0x134C9C1 MOV RAX, [RCX+0x108] ; next, also unchecked
+```
+
+`0x134C9B1` is `48 8B 05 38 B8 60 07`. RIP+disp lands on VA
+`0x1489581F0` (RVA `0x89581F0`). That qword is past the file-backed
+`.data` (virtual size `0x6EECA90`, raw size `0x626800`), so the loader
+zeroes it. The only write xref is `FUN_140d2fca0` at `0xD304B9`
+(`MOV [0x1489581F0], RDI`), inside the startup chain, not a value the
+probe can pass in a register. `FUN_14134c590` never mentions this
+global. The later load at `0x134C9D5` of `[0x148983150]` is the same
+class (a BSS pointer the caller does not pass) and is also unchecked
+at `0x134C9FA` (`MOV RCX, [RAX+0x50]`).
+
+Decision: **removed the call.** It is not one pointer the probe can
+read offline and pass. `--spawn-once` still injects, but the thread
+only writes
+
+```
+spawn-once blocked: FUN_14134c950 derefs [0x1489581F0]+0xF8 ...
+```
+
+and returns. It does not call `FUN_14134c950`. Do not expect
+`count=2` from this build.
+
+Selftest after the rebuild (offline exe, no inject, no launch):
+20/20, `SELFTEST OK`. New anchors: the reload at `0x134C9B1`
+(`48 8B 05 38 B8 60 07`) and `MOV RCX,[RAX+0xF8]` at `0x134C9BA`.
 
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
@@ -919,9 +969,13 @@ wedged, then rerun the command below on a freshly loaded save.
 - Ask JustAddMP/core author about a license (owner approval for contact).
 - Milestone 2: a second entity. One live call of `FUN_14134c950` from
  the injected thread faulted (`0xC0000005`) with `count` still 1.
- Do not write the double3. Do not call `FUN_14101bd70`. The next
- step is why that call faults on an injected thread (TLS fallback
- noted above), not another blind call.
+ The fault is `MOV RCX,[RAX+0xF8]` at RVA `0x134C9BA` after
+ `MOV RAX,[0x1489581F0]` with no null test. That global is BSS,
+ written only by `FUN_140d2fca0`, and the caller does not pass it.
+ `--spawn-once` no longer calls the function. Do not write the
+ double3. Do not call `FUN_14101bd70`. The next step is a game-thread
+ call of `FUN_14134c950` (Present/job hook), not another inject-thread
+ call and not a store of a guessed pointer.
 
 ## Sources
 

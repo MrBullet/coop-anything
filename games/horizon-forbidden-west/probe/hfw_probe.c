@@ -6,11 +6,13 @@
  *
  * --spawn-once (opt-in): the loader writes one byte, 1, to
  * hfw_probe.dll.mode next to this DLL. That file is not in the game
- * directory. The thread waits until the player-list count at [pm+0x08]
- * is at least 1, logs it, calls FUN_14134c950 exactly once inside SEH,
- * logs the count and [pm+0x10] again, then exits. That function allocates
- * a PlayerGame and the add slot pushes it. This mode does not store the
- * entity double3 and does not call FUN_14101bd70.
+ * directory. The thread does NOT call FUN_14134c950. One live call
+ * raised 0xC0000005: the function's first load is
+ * MOV RAX,[0x1489581F0] and the next load, MOV RCX,[RAX+0xF8] at
+ * RVA 0x134C9BA, is not behind the null test. That qword is BSS
+ * (written once, by FUN_140d2fca0). The only caller, FUN_14134c590,
+ * does not pass it in a register. This mode logs the block and exits.
+ * It does not store the entity double3 and does not call FUN_14101bd70.
  *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
@@ -57,10 +59,10 @@
 #define SAMPLE_COUNT 450 /* 45 s at 10 Hz */
 #define WAIT_TICKS 600 /* 60 s at 10 Hz for a save to load */
 
-/* void FUN_14134c950(undefined8). The only caller is CALL rel32 at RVA
- * 0x134C657, with no register setup, and the MOV [RSP+8],RCX in the
- * prologue is never read. Allocation size is the dword at RVA 0x21615A0. */
-typedef void (__fastcall *spawn_fn)(unsigned long long unused);
+/* FUN_14134c950 is not called. First unchecked deref is
+ * RVA 0x134C9BA: MOV RCX, [RAX+0xF8] where RAX came from
+ * MOV RAX, [0x1489581F0] at 0x134C9B1. RVA of that global: */
+#define RVA_SPAWN_CTX 0x89581F0ull
 
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
@@ -100,79 +102,25 @@ static int finite_d(double v)
  return isfinite(v) && v < 1.0e7 && v > -1.0e7;
 }
 
-static int call_spawn(unsigned long long fn, unsigned int *code)
-{
- __try {
- ((spawn_fn)fn)(0);
- return 1;
- } __except (EXCEPTION_EXECUTE_HANDLER) {
- if (code) *code = GetExceptionCode();
- InterlockedIncrement(&g_faults);
- return 0;
- }
-}
-
-/* Wait for a loaded save, call the live spawn path once, log the count. */
+/* Do not call FUN_14134c950. Log why and return. */
 static DWORD WINAPI spawn_once(LPVOID unused)
 {
  FILE *fp;
- int i;
- unsigned int before = 0;
- unsigned int after = 0;
- unsigned long long storage_before = 0;
- unsigned long long storage_after = 0;
- unsigned int code = 0;
- int called = 0;
- int ready = 0;
+ unsigned long long ctx = 0;
  (void)unused;
 
  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
  fopen_s(&fp, "hfw-probe.log", "w");
  if (!fp) return 0;
  setvbuf(fp, NULL, _IOFBF, 8192);
- fprintf(fp, "spawn-once start call=FUN_14134c950 no-pose-write\n");
- fflush(fp);
-
- /* 60 s at 10 Hz. A save that never loads is a timeout, not a call. */
- for (i = 0; i < 600 && !g_stop; i++) {
- unsigned long long pm = rd64(exe_base() + RVA_PLAYER_MANAGER);
- if (pm) {
- before = rd32(pm + OFF_LIST_COUNT);
- storage_before = rd64(pm + OFF_LIST_STORAGE);
- if (before >= 1) {
- ready = 1;
- break;
- }
- }
- if ((i % SAMPLE_HZ) == (SAMPLE_HZ - 1)) fflush(fp);
- Sleep(SAMPLE_MS);
- }
-
- if (!ready) {
- fprintf(fp, "spawn-once timeout count=%u storage=0x%llX faults=%ld\n",
- before, storage_before, g_faults);
- fflush(fp);
- fclose(fp);
- return 0;
- }
-
- fprintf(fp, "spawn-once before count=%u storage=0x%llX\n",
- before, storage_before);
- fflush(fp);
-
- called = call_spawn(exe_base() + RVA_SPAWN, &code);
-
- {
- unsigned long long pm = rd64(exe_base() + RVA_PLAYER_MANAGER);
- if (pm) {
- after = rd32(pm + OFF_LIST_COUNT);
- storage_after = rd64(pm + OFF_LIST_STORAGE);
- }
- }
+ ctx = rd64(exe_base() + RVA_SPAWN_CTX);
  fprintf(fp,
- "spawn-once after called=%d code=0x%08X count=%u storage=0x%llX "
- "delta=%d faults=%ld\n",
- called, code, after, storage_after, (int)after - (int)before, g_faults);
+ "spawn-once blocked: FUN_14134c950 derefs [0x1489581F0]+0xF8 "
+ "(RAX from MOV RAX,[0x1489581F0] at RVA 0x134C9B1, then "
+ "MOV RCX,[RAX+0xF8] at 0x134C9BA with no null test). "
+ "live qword=0x%llX. caller FUN_14134c590 does not pass it. "
+ "not called. count stays.\n",
+ ctx);
  fflush(fp);
  fclose(fp);
  return 0;
