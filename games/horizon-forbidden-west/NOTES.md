@@ -1,10 +1,10 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 1 research complete, phase 2 (binaries-only workspace), phase 3
-complete (Ghidra headless reachability), phase 4 decision memo written** —
-2026-10-20. Claim issue: cranebeaker/coop-anything#83.
-Phase-4 recommendation: **route (c)** — see [DECISION.md](DECISION.md).
-No code, no mod, no test run yet.
+Status: **phase 5 milestone 1 built** (2026-10-21) — read-only probe
+(`probe/`) with an offline RVA selftest that passes against the workspace exe.
+Runtime injection is blocked: Steam has no library entry for this install, so
+`-applaunch` does not start the game. Manual steps below. Claim issue:
+cranebeaker/coop-anything#83. Route **(c)** — see [DECISION.md](DECISION.md).
 
 ## Game identity (observed, verified this session)
 
@@ -261,15 +261,101 @@ byte-exact**; details table in [DECISION.md](DECISION.md). Highlights:
 - JustAddMP/core license (none stated) — matters before building on it (rule 7).
 - Whether Decima's async/strand-like structures exist in HFW (Death Stranding does).
 
+## Phase 5 milestone 1: read-only probe (2026-10-21)
+
+### Injection approach — why Strikers, not Cauldron
+
+Strikers (MIT, cloned under `local/`) is the pattern, because its RVAs are
+byte-exact on this exe and Cauldron's are not. What Strikers actually does
+(`src/live-probe/`): an external .NET process `OpenProcess`es the game, reads
+the PE header, and **refuses every write unless the build is `667B1777-949F000`**
+(`Program.cs` `KnownBuilds`). The three things that need code inside the game
+(allocator calls, board-size patches) go in as a stub: `VirtualAllocEx` a page,
+`WriteProcessMemory` the bytes, `CreateRemoteThread` it
+(`Program.GameAlloc.cs`, `Program.BlightLoad.cs`). Everything else is read with
+`ReadProcessMemory` from outside.
+
+Cauldron (GPL-3.0, also under `local/`) instead drops a `winhttp.dll` proxy
+beside the exe and loads mods from there (`crates/winhttp/src/lib.rs`). That
+means writing a DLL into the install — which we will not do — and its address
+table targets HZD, not this HFW build. So: external process, Strikers' guard
+shape, our own DLL for the per-frame read.
+
+### Address anchors (this exe, image base `0x140000000`)
+
+Strikers' memory map covers Machine Strike only, so the player chain is from a
+targeted Ghidra pass on the existing project (`-noanalysis`, no re-analysis).
+Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
+
+| What | RVA | Evidence |
+|---|---|---|
+| `PlayerManagerGame*` global | `0x8982C80` | ctor `FUN_140d5e2c0` writes it right after setting `PlayerManagerGame::vftable` |
+| `SceneManagerGame*` global | `0x8982DD0` | same ctor, `FUN_140d7f620` sets the vftable, 0x250-byte object |
+| player list | `pm+0x08` count, `pm+0x10` ptr[] | `FUN_140d34130` walks exactly this |
+| local player | first entry, `[pm+0x10]` | `GetLocalPlayer` (`FUN_140928430`) copies that list out |
+| entity | `player+0x48` | `FUN_140916bf0`, the only caller of the local-player lookup |
+| position | `entity+0xD8`, 3 floats | `vmovups xmm6, [rbp+0xD8]` at RVA `0xD4F8D4` |
+| heading | `entity+0xE8`, float | `vmovsd xmm7, [rbp+0xE8]` at RVA `0xD4F8DC` |
+| world id | `[[scene+0x248]]`, uint32 | `FUN_140aa0d05` / `FUN_140aa13c1` read a resource id there |
+
+`GetLocalPlayer` is the script export `Player_sExportedGetLocalPlayer`
+(string RVA `0x18A9E08`); its function pointer is loaded at RVA `0x91357F`.
+
+### What was built
+
+`games/horizon-forbidden-west/probe/`:
+
+- `hfw_probe.c` — injected DLL. On attach it spawns a thread that, 30 times a
+ second for ~50 s, reads the chain above and appends
+ `frame world=0xXXXXXXXX entity=0xXXXXXXXXXXXXXXXX pos=(x,y,z) heading=h`
+ to `hfw-probe.log`. It never writes game memory; every read is in `__try`.
+- `hfw-probe.cs` — loader. Refuses to run unless the exe's SHA-256 is
+ `9cec6626…02055429e` **and** the PE stamp is `667B1777-949F000` (Strikers'
+ guard plus the hash). `--selftest` checks the anchor bytes above, including
+ three Strikers rows, against the exe on disk.
+
+Built with the VS 2026 Build Tools already on the machine (`cl 14.51`) and the
+.NET 10 SDK. Nothing new installed. `hfw_probe.dll` is 147,456 bytes.
+
+### Offline test (ran)
+
+```
+dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
+```
+
+11/11 PASS against the binaries-only workspace copy of the exe: SHA-256 + PE
+guard, the three Strikers rows, and all six anchors above.
+
+### Runtime test (blocked — manual steps)
+
+Steam is logged in, but `steamapps/libraryfolders.vdf` lists only `C:`, `E:`,
+`K:`, `D:`. The install is on a drive that is not one of them, and
+`steam.exe -applaunch 2420110` logged `ExecCommandLine` and started nothing
+(no game process after 20 s). Launching the exe directly would trip
+`SteamAPI_RestartAppIfNecessary` and restart through Steam, which fails the
+same way. No second attempt made; the game was not left running.
+
+The save under `%USERPROFILE%\Documents\Horizon Forbidden West Complete Edition\`
+(one `profile.dat`, 197,012 bytes) was copied into `local/` before the launch
+attempt. `<game dir>` was not written.
+
+To run it:
+
+1. Add the install's drive as a Steam library folder (Steam → Settings →
+ Storage → Add Drive), so app 2420110 resolves.
+2. Start the game and load a save so a player entity exists.
+3. From `probe/`: `hfw-probe.exe --exe "<game dir>\HorizonForbiddenWest.exe" --seconds 45`.
+ The loader checks the hash, injects `hfw_probe.dll`, and the log appears as
+ `hfw-probe.log` in the game's working directory.
+4. Close the game. Do not leave it running.
+
 ## Not tried (next session)
 
-- Runtime launch of the workspace copy (needs full install or instance plan),
-  socket activity observation, single-instance mutex survey for two copies.
-- Phase 5 first milestone: injected module that logs per frame + reads the local
-  player's transform/world id (how-coop-mods-work.md stage 1 exit test), with a
-  runtime build-id guard copied from Strikers.
+- Runtime confirmation of the chain (needs the Steam library entry above).
+- Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
+- Milestone 2: one puppet driven by our own transport, two instances.
 
 ## Sources
 
