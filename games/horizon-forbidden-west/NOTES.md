@@ -2004,6 +2004,118 @@ record's size dword (`FF FF FF FF 04 .. 00 03 00 00` at `0x21DA6C0`,
 file offset `0x21D9AC0`) and the constructor slot
 (`80 09 1A 41 01 00 00 00` at `0x21DA6D8`).
 
+### `--alloc-entity` live, vtable confirmed (2026-10-21)
+
+The owner ran it. The game did not crash. Copied from the owner's log
+(the game was still running):
+
+```
+alloc-entity start one-shot gate=GameModule@0x8983150 steps=ctor-from-record,size-from-record,alloc,place record=0x21DA6C0 factory-not-called
+alloc-entity gate module=0x1D480132300 waited_s=0 faults=0
+alloc-entity stop ptr=0x1CEAD250600 vtable=0x7FF62AFF8958 size=0x300 ctor=0x7FF62A840980 seh=0x00000000 (factory not called, not inserted)
+```
+
+`ctor=0x7FF62A840980` is `FUN_1411a0980` (RVA `0x11A0980`). The
+preferred image base is `0x140000000`, but this process is rebased.
+The runtime image base is `0x7FF62A840980 - 0x11A0980 =
+0x7FF6296A0000`. The vtable the constructor wrote is
+`0x7FF62AFF8958 - 0x7FF6296A0000 = 0x1958958`.
+
+That matches. One `-noanalysis -readOnly -process` pass
+(`local/ghidra_scripts/CamListWalk.java`, report
+`local/cam_list_walk.txt`) quotes the symbol Ghidra already has:
+
+```
+VA 0x141958958 RVA 0x1958958 primary +0 written by FUN_1411a0980 symbol=ControlledEntity::vftable
+```
+
+`FUN_1411a0980` writes it with `LEA RAX, [0x141958958]` at RVA
+`0x11A0995` and `MOV [RBX], RAX` at `0x11A099C`
+(`local/factory_inner.txt`). The two sub-vtables at `+0x20` and
+`+0x30` are the same class (`0x1419588C0`, `0x141958B08`). The live
+object is a `ControlledEntity`. `size=0x300` and `seh=0x00000000`.
+The four steps return a live object and do not crash the game.
+
+### The camera-list walker (`FUN_140930e90`)
+
+The previous crash published the owner's entity. The question this
+time is a fresh `ControlledEntity`. Two more read-only passes
+(`CamWalkBody.java`, `CamSlot.java`, `CamSlot2.java`; reports
+`local/cam_walk_body.txt`, `local/cam_slot.txt`, `local/cam_slot2.txt`).
+No re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`.
+
+`FUN_1400fe310` at `0xD733E7` stores `PlayerGame+0x130` into the array
+at `[CameraPredictionManager+0x38]` and the count at `+0x30`. The
+function that walks that array on the next tick is `FUN_140930e90`
+(`0x930E90`):
+
+```
+RVA 0x930FEE MOV RDI, [R13+0x38] ; the array
+RVA 0x930FF8 MOVSXD RAX, dword ptr [R13+0x30] ; the count
+RVA 0x931026 MOV RDX, [RDI] ; one entry, PlayerGame+0x130
+RVA 0x931056 MOV RAX, [RDX] ; its vtable
+RVA 0x931073 CALL [RAX+8] ; no null test
+```
+
+`FUN_140d73270` writes that entry's vtable itself, before the publish:
+`LEA RAX, [0x1418FBEF0]` / `MOV [R14], RAX` at `0xD732BD` / `0xD732C4`.
+Slot `+8` of `PlayerGame::vftable` is `FUN_140d794f0`. Its first act
+is `LEA RBX, [RCX-0x130]` (back to the `PlayerGame`) and
+`CALL FUN_1409150e0`. That function's first field load is the count:
+
+```
+RVA 0x91510A MOV EDX, [RBX+0xF0]
+RVA 0x915110 SUB EDX, 1
+RVA 0x915113 JS 0x140915152 ; count was 0: return 0
+```
+
+The pointer at `[PlayerGame+0xF8]` is only loaded at `0x915115`, which
+this jump skips. `FUN_140d794f0` then tests the result
+(`TEST RAX, RAX` / `JZ` at `0xD7950F`) and returns. `FUN_140913be0`,
+which `FUN_140d73270` calls at `0xD73285` before the publish, writes
+both of those: `MOV [RDI+0xF0], RSI` at `0x913C9C` and
+`MOV [RDI+0xF8], RSI` at `0x913CA3`, with `RSI` zeroed at `0x913BEF`.
+The same function `InitializeSRWLock`s `[PlayerGame+0x100]` at
+`0x913CAA`, and that is the lock `FUN_1409150e0` acquires first
+(`LEA RDI, [RCX+0x100]` at `0x9150EA`).
+
+So the next tick reads the vtable the constructor wrote, the count
+the constructor zeroed, and the lock the constructor initialized. It
+does not follow `[PlayerGame+0xF8]`. It also does not read the
+`ControlledEntity`: `FUN_140d794f0` returns before
+`FUN_140914f80`'s result is used as a pointer, and `FUN_140914f80`
+returns 0 for the same zero count. The entity argument only lands at
+`[PlayerGame+0x30]` (`0x913CB7`), which this walk does not load.
+
+`--link-puppet` is the one-shot that does this. It waits until
+`GameModule*` and `[0x148982CB0]` are both non-null, runs the four
+steps, allocates `0x210`, calls `FUN_140d73270(playerBlock, newEntity)`
+once, logs both pointers and the SEH code, and returns. It does not
+call the factory, does not pass the owner's entity, does not call
+`FUN_1402250c0`, and does not write `entity+0xD8`. `--add-player`
+stays alloc-only.
+
+Start a fresh session and load a save first. A hitch is possible
+while the constructor holds the camera lock; alt-f4 if the game
+wedges. The owner's character should not move. A visible body is not
+expected yet. From `probe\bin\Release\net10.0`:
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--link-puppet'
+```
+
+The line to look for is `link-puppet stop player=0x` with a non-zero
+`entity=0x`, `size=0x300` and `seh=0x00000000`.
+
+Selftest is 46/46 on the offline exe. The six new anchors are the
+walker's call (`FF 50 08` at `0x931073`), the count load and its
+`JS` (`8B 93 F0 00 00 00 83 EA 01 78` at `0x91510A`), the constructor's
+zero store (`48 89 B7 F0 00 00 00` at `0x913C9C`), the link prologue
+(`48 89 5C 24 10 48 89 6C` at `0xD73270`), and the two list loads
+(`49 63 45 30` at `0x930FF8`, `49 8B 7D 38` at `0x930FEE`). No inject,
+no launch.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)

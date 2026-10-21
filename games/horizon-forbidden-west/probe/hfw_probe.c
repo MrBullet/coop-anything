@@ -65,6 +65,19 @@
  * the second call the factory makes at 0x1F85FC. The pointer is logged
  * and the thread returns. The game never walks the block.
  *
+ * --link-puppet (opt-in, mode byte 6): one shot, then exit. Same four
+ * steps as --alloc-entity (the factory is not called), then
+ * FUN_1401e6100(0x210) and FUN_140d73270(playerBlock, newEntity) once.
+ * RDX is the new ControlledEntity, never [[GameModule+0x50]+0x20].
+ * FUN_1402250c0 is not called, so the player list is not touched.
+ * The camera walker FUN_140930e90 calls [entry+8], which is
+ * FUN_140d794f0. That calls FUN_1409150e0, whose first field load is
+ * the count at [PlayerGame+0xF0]. FUN_140913be0 stores 0 there
+ * (0x913C9C) before the publish at 0xD733E7, and the JS arm at
+ * 0x915113 returns without loading [PlayerGame+0xF8]. The SRWLOCK at
+ * [PlayerGame+0x100] is InitializeSRWLock'd by the same constructor
+ * before the publish. entity+0xD8 is not written.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -139,6 +152,7 @@
 #define RVA_CTOR_FROM_RECORD 0x2033D0ull
 #define RVA_SIZE_FROM_RECORD 0x2032D0ull
 #define RVA_PLACE_CONTROLLED 0x11A0980ull
+#define RVA_LINK_PLAYER 0xD73270ull
 
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
@@ -205,6 +219,7 @@ static DWORD WINAPI spawn_once(LPVOID unused)
 typedef unsigned long long (__fastcall *alloc_fn)(unsigned long long size);
 typedef unsigned long long (__fastcall *record_fn)(unsigned long long record);
 typedef void (__fastcall *place_fn)(unsigned long long record, unsigned long long block);
+typedef unsigned long long (__fastcall *link_fn)(unsigned long long block, unsigned long long entity);
 
 /* One shot. Four inner steps of FUN_1401f82b0, not the factory.
  * The factory is not called: its RCX is a parent container the probe
@@ -276,6 +291,89 @@ static DWORD WINAPI alloc_entity(LPVOID unused)
  "alloc-entity stop ptr=0x%llX vtable=0x%llX size=0x%X "
  "ctor=0x%llX seh=0x%08X (factory not called, not inserted)\n",
  block, vtable, size, ctor, seh);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+}
+
+/* One shot. Four alloc steps, then a PlayerGame whose +0x30 is the
+ * new entity, then FUN_140d73270 once. The owner's entity is not an
+ * argument. FUN_1402250c0 is not called. */
+static DWORD WINAPI link_puppet(LPVOID unused)
+{
+ FILE *fp;
+ int waited = 0;
+ unsigned long long base;
+ unsigned long long module = 0;
+ unsigned long long cam = 0;
+ unsigned long long record;
+ unsigned long long ctor = 0;
+ unsigned int size = 0;
+ unsigned long long entity = 0;
+ unsigned long long player = 0;
+ unsigned long long vtable = 0;
+ unsigned int seh = 0;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IONBF, 0);
+
+ fprintf(fp,
+ "link-puppet start one-shot gate=GameModule@0x8983150 "
+ "cam=0x8982CB0 steps=ctor-from-record,size-from-record,alloc,"
+ "place,alloc-player,link record=0x21DA6C0 factory-not-called "
+ "owner-not-passed\n");
+
+ while (!g_stop && waited < SLOT_WAIT_TICKS) {
+ base = exe_base();
+ module = rd64(base + RVA_GAME_MODULE);
+ cam = rd64(base + RVA_CTOR_SCENE);
+ if (module && cam) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp,
+ "link-puppet gate module=0x%llX cam=0x%llX waited_s=%d faults=%ld\n",
+ module, cam, waited / SLOT_HZ, g_faults);
+
+ if (!module || !cam) {
+ fprintf(fp,
+ "link-puppet timeout. FUN_1402033d0, FUN_1402032d0, "
+ "FUN_1401e6100, FUN_1411a0980 and FUN_140d73270 not called. "
+ "FUN_1402250c0 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ base = exe_base();
+ record = base + RVA_ENTITY_RECORD;
+ __try {
+ record_fn ctor_from = (record_fn)(base + RVA_CTOR_FROM_RECORD);
+ record_fn size_from = (record_fn)(base + RVA_SIZE_FROM_RECORD);
+ alloc_fn alloc = (alloc_fn)(base + RVA_ALLOC);
+ place_fn place = (place_fn)(base + RVA_PLACE_CONTROLLED);
+ link_fn link = (link_fn)(base + RVA_LINK_PLAYER);
+ ctor = ctor_from(record);
+ size = (unsigned int)size_from(record);
+ entity = alloc((unsigned long long)size);
+ if (entity) place(record, entity);
+ player = alloc(PLAYER_GAME_SIZE);
+ if (entity && player) link(player, entity);
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ if (entity && !seh) vtable = rd64(entity);
+
+ fprintf(fp,
+ "link-puppet stop player=0x%llX entity=0x%llX vtable=0x%llX "
+ "size=0x%X ctor=0x%llX seh=0x%08X "
+ "(owner not passed, FUN_1402250c0 not called)\n",
+ player, entity, vtable, size, ctor, seh);
  fflush(fp);
  fclose(fp);
  return 0;
@@ -605,6 +703,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  else if (mode == 3) entry = add_player;
  else if (mode == 4) entry = read_cam;
  else if (mode == 5) entry = alloc_entity;
+ else if (mode == 6) entry = link_puppet;
  thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {

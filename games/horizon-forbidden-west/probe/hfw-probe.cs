@@ -67,6 +67,22 @@
 // This does not spawn a visible character and does not touch the
 // owner's player. The pointer in the log is the whole result.
 //
+// --link-puppet: opt-in. Mode byte 6. One shot, then the thread exits.
+// Same four steps as --alloc-entity (FUN_1401f82b0 is not called),
+// then FUN_1401e6100(0x210) and FUN_140d73270(playerBlock, newEntity)
+// once. The entity argument is the new ControlledEntity, not
+// [[GameModule+0x50]+0x20]. FUN_1402250c0 is not called. The camera
+// walker FUN_140930e90 calls the published entry's vtable+8
+// (FUN_140d794f0), which calls FUN_1409150e0. That function's first
+// field load is the count at [PlayerGame+0xF0], which FUN_140913be0
+// stores as 0 at RVA 0x913C9C before the publish at 0xD733E7, and the
+// JS arm at 0x915113 returns without loading the pointer at +0xF8.
+// The line to look for is
+// "link-puppet stop player=0x.. entity=0x.. vtable=0x.. seh=0x00000000".
+// No visible body is expected. The owner's character should not move.
+// A hitch is possible while the constructor holds the camera lock;
+// alt-f4 if the game wedges. Start a fresh session and load a save.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -156,16 +172,18 @@ internal static class Program
  var addPlayer = HasFlag(args, "--add-player");
  var readCam = HasFlag(args, "--read-cam");
  var allocEntity = HasFlag(args, "--alloc-entity");
+ var linkPuppet = HasFlag(args, "--link-puppet");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
  Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
  Note(addPlayer ? "add-player flag seen" : "add-player flag absent");
  Note(readCam ? "read-cam flag seen" : "read-cam flag absent");
  Note(allocEntity ? "alloc-entity flag seen" : "alloc-entity flag absent");
+ Note(linkPuppet ? "link-puppet flag seen" : "link-puppet flag absent");
  var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0)
- + (readCam ? 1 : 0) + (allocEntity ? 1 : 0);
+ + (readCam ? 1 : 0) + (allocEntity ? 1 : 0) + (linkPuppet ? 1 : 0);
  if (modes > 1)
  {
- Note("REFUSED: --spawn-once, --read-slot, --add-player, --read-cam and --alloc-entity are mutually exclusive.");
+ Note("REFUSED: --spawn-once, --read-slot, --add-player, --read-cam, --alloc-entity and --link-puppet are mutually exclusive.");
  return 2;
  }
 
@@ -209,8 +227,9 @@ internal static class Program
  // the block and does not call FUN_14134c950. --read-slot injects a
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
- // 2 read-slot, 3 add-player (one shot), 4 read-cam, 5 alloc-entity.
- var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : (allocEntity ? 5 : 0))));
+ // 2 read-slot, 3 add-player (one shot), 4 read-cam, 5 alloc-entity,
+ // 6 link-puppet (one shot).
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : (allocEntity ? 5 : (linkPuppet ? 6 : 0)))));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
@@ -223,6 +242,7 @@ internal static class Program
  : mode == 3 ? "injected mode=add-player"
  : mode == 4 ? "injected mode=read-cam"
  : mode == 5 ? "injected mode=alloc-entity"
+ : mode == 6 ? "injected mode=link-puppet"
  : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
@@ -278,6 +298,21 @@ internal static class Program
  "the line to look for is 'alloc-entity stop ptr=0x' with a non-zero pointer. " +
  "this does not spawn a visible character and does not touch the player's entity. " +
  "the pointer in the log is the whole result. a hitch is unlikely; alt-f4 if wedged.");
+ return 0;
+ }
+ if (linkPuppet)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=link-puppet. " +
+ "one shot: the four inner steps, then FUN_1401e6100(0x210), then " +
+ "FUN_140d73270(playerBlock, newEntity) once, then exit. " +
+ "FUN_1401f82b0 is not called. the owner's entity is not passed. " +
+ "FUN_1402250c0 is not called, so the player list is not touched. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ "start a fresh session, load a save first. a hitch is possible " +
+ "while the constructor holds the camera lock; alt-f4 if wedged. " +
+ "the line to look for is 'link-puppet stop player=0x' with entity=0x " +
+ "and seh=0x00000000. the owner's character should not move. " +
+ "a visible body is not expected yet.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -345,7 +380,8 @@ internal static class Program
  // own file (the loader's copy, not the game directory) to decide
  // which thread to start. The remote thread is still LoadLibraryW.
  // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam,
- // 5 alloc-entity (four inner steps, factory not called).
+ // 5 alloc-entity (four inner steps, factory not called),
+ // 6 link-puppet (four steps, then FUN_140d73270 with the new entity).
  File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
@@ -555,6 +591,21 @@ internal static class Program
  // constructor qword at +0x18 is 0x1411A0980, FUN_1411a0980.
  ("record tag+size", 0x21DA6C0, "FF FF FF FF 04 00 01 00 00 00 FF 00 00 00 00 00 00 03 00 00"),
  ("record ctor slot", 0x21DA6D8, "80 09 1A 41 01 00 00 00"),
+ // FUN_140930e90 walks the camera list and calls [entry vtable+8]
+ // with no null test. That slot is FUN_140d794f0, which calls
+ // FUN_1409150e0. The first field load there is the count at
+ // [PlayerGame+0xF0], and the next instruction subtracts one and
+ // jumps away when the result is negative. FUN_140913be0 stores 0
+ // at that offset before FUN_140d73270 publishes the entry.
+ ("walker call vtable+8", 0x931073, "FF 50 08"),
+ ("walker count load +0xF0", 0x91510A, "8B 93 F0 00 00 00 83 EA 01 78"),
+ ("ctor zeroes count +0xF0", 0x913C9C, "48 89 B7 F0 00 00 00"),
+ // FUN_140d73270 prologue. --link-puppet calls this entry once,
+ // with the new entity, and does not call FUN_1402250c0.
+ ("link FUN_140d73270", 0xD73270, "48 89 5C 24 10 48 89 6C"),
+ // The list the walker reads: count at +0x30, array at +0x38.
+ ("walker list count +0x30", 0x930FF8, "49 63 45 30 4C 8B 7D"),
+ ("walker list array +0x38", 0x930FEE, "49 8B 7D 38 41 B9 01"),
  };
 
  var pe = File.ReadAllBytes(exe);
