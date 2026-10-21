@@ -10,31 +10,21 @@
  * player = [[pm + 0x10]] first entry (count at +0x08)
  * entity = [player + 0x48] FUN_140916bf0
  *
- * The 2026-10-21 live log showed that entity+0xD8 is NOT a Vec3 of floats.
- * FUN_140d4f750 copies three qwords from entity+0xD8/+0xE0/+0xE8. Those stay
- * in the log as the old= side column.
+ * World position is the double3 at entity+0xD8/+0xE0/+0xE8. The walk run
+ * (local/hfw-probe-run2.log, 450 samples, entity 0x25700154D00, faults=0)
+ * tracked it: still until sample 87, then 10.125 m first-to-last, path
+ * length 110.690 m. All 450 finite. FUN_140962590 copies exactly these
+ * three qwords under the lock at entity+0x298 (TryEnter, else Enter, then
+ * Leave). FUN_140962640 copies them in the same locked read as the Mat34.
+ * This probe does not take that lock and does not call either function.
  *
- * The world transform is the Mat34 that Entity_ExportedGetWorldTransform
- * returns. Registrar FUN_14095bfb0 binds that name to FUN_140962640, which
- * locks entity+0x298 and copies:
- *   +0xD8/+0xE0/+0xE8   three qwords (the rejected read)
- *   +0xF0 .. +0x128     0x3C-byte Mat34 (3x4 floats, row-major)
- *   +0x110              one float (the last column's w)
- * FUN_140962440 reads the same Mat34 at +0xF0 and transposes it.
- * Translation is the last row: floats at +0x114, +0x118, +0x11C.
- * Heading is the forward vector, row 2: floats at +0x108, +0x10C, +0x110.
+ * The Mat34 at entity+0xF0 is not the live world position. On that walk its
+ * translation stayed at X=0, Z=5.73 m, and Y tore to ~1e38. It is logged
+ * as mat= and never sets sane=.
  *
- * sane=1 only when those three translation floats are finite and inside
- * +/-1e7. The old qwords never set it.
+ * sane=1 only when the three doubles are finite and inside +/-1e7.
  *
- * The 2026-10-21 second live run wrote all 450 samples, sane=1 on every
- * line, counter climbing the whole time, faults=0. pos= never changed.
- * That freeze was the loader's console taking foreground (HFW pauses on
- * focus loss), not a stalled worker. This build does not AllocConsole,
- * does not AttachConsole, and fflush's at most once a second.
- *
- * [[scene + 0x248]] counted 0x2280 -> 0x32AC on that run, so it is logged
- * as a uint32 counter, not a world id. No stable world id was found.
+ * [[scene + 0x248]] is a frame counter, not a world id.
  *
  * Build: cl /LD /O2 /GS- hfw_probe.c /link /OUT:hfw_probe.dll
  */
@@ -48,7 +38,7 @@
 #define RVA_SCENE_MANAGER 0x8982DD0ull
 #define OFF_LIST_STORAGE 0x10
 #define OFF_PLAYER_ENTITY 0x48
-#define OFF_ENTITY_OLD 0xD8
+#define OFF_ENTITY_POS 0xD8
 #define OFF_ENTITY_MAT 0xF0
 #define OFF_SCENE_WORD 0x248
 
@@ -89,9 +79,9 @@ static unsigned int rd32(unsigned long long a)
  return v;
 }
 
-static int finite_f(float v)
+static int finite_d(double v)
 {
- return isfinite(v) && v < 1.0e7f && v > -1.0e7f;
+ return isfinite(v) && v < 1.0e7 && v > -1.0e7;
 }
 
 static DWORD WINAPI logger(LPVOID unused)
@@ -109,7 +99,7 @@ static DWORD WINAPI logger(LPVOID unused)
  /* One flush a second. fflush every sample is disk IO inside the game. */
  setvbuf(fp, NULL, _IOFBF, 8192);
 
- fprintf(fp, "probe start hz=%d samples=%d read-only no-hook mat34\n",
+ fprintf(fp, "probe start hz=%d samples=%d read-only no-hook double3\n",
  SAMPLE_HZ, SAMPLE_COUNT);
 
  for (i = 0; i < SAMPLE_COUNT && !g_stop; i++) {
@@ -118,10 +108,9 @@ static DWORD WINAPI logger(LPVOID unused)
  unsigned long long scene = rd64(base + RVA_SCENE_MANAGER);
  unsigned int counter = 0;
  unsigned long long entity = 0;
- unsigned long long raw[3] = {0, 0, 0};
+ double pos[3] = {0, 0, 0};
  float mat[15];
- float tx = 0, ty = 0, tz = 0;
- float hx = 0, hy = 0, hz = 0;
+ float mx = 0, my = 0, mz = 0;
  int k;
  int got = 0;
  int got_mat = 0;
@@ -138,11 +127,10 @@ static DWORD WINAPI logger(LPVOID unused)
  unsigned long long player = storage ? rd64(storage) : 0;
  entity = player ? rd64(player + OFF_PLAYER_ENTITY) : 0;
  if (entity) {
- got = rd_bytes(entity + OFF_ENTITY_OLD, raw, sizeof(raw));
+ got = rd_bytes(entity + OFF_ENTITY_POS, pos, sizeof(pos));
  got_mat = rd_bytes(entity + OFF_ENTITY_MAT, mat, sizeof(mat));
  if (got_mat) {
- hx = mat[6]; hy = mat[7]; hz = mat[8];
- tx = mat[9]; ty = mat[10]; tz = mat[11];
+ mx = mat[9]; my = mat[10]; mz = mat[11];
  }
  }
  }
@@ -154,14 +142,14 @@ static DWORD WINAPI logger(LPVOID unused)
  faults_logged++;
  }
  } else {
- int sane = got_mat && finite_f(tx) && finite_f(ty) && finite_f(tz);
+ int sane = got && finite_d(pos[0]) && finite_d(pos[1]) && finite_d(pos[2]);
  fprintf(fp,
  "sample=%d counter=0x%08X entity=0x%llX "
- "pos=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) sane=%d "
- "old=%016llX %016llX %016llX\n",
+ "pos=(%.3f,%.3f,%.3f) sane=%d "
+ "mat=(%.3f,%.3f,%.3f)\n",
  i, counter, entity,
- tx, ty, tz, hx, hy, hz, sane,
- raw[0], raw[1], raw[2]);
+ pos[0], pos[1], pos[2], sane,
+ mx, my, mz);
  }
  if ((i % SAMPLE_HZ) == (SAMPLE_HZ - 1)) fflush(fp);
  Sleep(SAMPLE_MS);

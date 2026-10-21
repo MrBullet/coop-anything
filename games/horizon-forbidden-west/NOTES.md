@@ -1,10 +1,11 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5 milestone 1 not confirmed** (2026-10-21) — third live
-run, owner walking in borderless windowed. `pos=` (Mat34 translation) did
-**not** track movement. The side-column doubles at `entity+0xD8` did.
-Route **(c)** stays blocked on a position read. Do not write the Mat34
-and do not spawn a puppet from this offset. Claim issue:
+Status: **phase 5 milestone 1 corrected** (2026-10-21) — the walk run
+showed the world position is the double3 at `entity+0xD8`, not the Mat34.
+The probe now reads that double3. A setter that takes the
+`entity+0x298` lock was not found; the functions that do write those
+qwords are the constructor and a struct clone. Route **(c)** is still
+blocked on a write of that double3. Claim issue:
 cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 ## Game identity (observed, verified this session)
@@ -295,10 +296,9 @@ Scripts in `local/ghidra_scripts/`, decompiles in `local/`.
 | player list | `pm+0x08` count, `pm+0x10` ptr[] | `FUN_140d34130` walks exactly this |
 | local player | first entry, `[pm+0x10]` | `GetLocalPlayer` (`FUN_140928430`) copies that list out |
 | entity | `player+0x48` | `FUN_140916bf0`, the only caller of the local-player lookup |
-| position | `entity+0xF0`, Mat34, 0x3C bytes | `FUN_140962640` (`Entity_ExportedGetWorldTransform`), `vmovups ymm0, [rdi+0xF0]` at RVA `0x962697` |
-| translation | last row, floats at `+0x114/+0x118/+0x11C` | same copy; row-major 3x4 |
-| heading | row 2, floats at `+0x108/+0x10C/+0x110` | `FUN_140962440` transposes the same matrix |
-| rejected | `entity+0xD8`, three qwords | `FUN_140d4f750` copies them; the live log is not a position |
+| position | `entity+0xD8`, three doubles | walk run tracked them; `FUN_140962590` copies `+0xD8/+0xE0/+0xE8` under the lock at `entity+0x298` |
+| not position | `entity+0xF0`, Mat34, 0x3C bytes | `FUN_140962640` also copies this; the walk run's translation did not move |
+| ctor of both | `FUN_140948a10` | zeroes the three qwords (`MOV [RCX+0xD8], RBP` at RVA `0x948AEE`, RBP is 0) and writes the identity Mat34 at `+0xF0` from `0x141fdffd0` |
 | scene counter | `[[scene+0x248]]`, uint32 | `FUN_140aa0a00` reads it; it counted every frame |
 
 `GetLocalPlayer` is the script export `Player_sExportedGetLocalPlayer`
@@ -574,17 +574,96 @@ They sit still through sample 87 (same place as the paused run's
 `FUN_140962640` copies those three qwords in the same locked read as the
 Mat34. The paused run could not tell them apart because both were still.
 This run separates them: the doubles move, the Mat34 translation and
-forward do not. Milestone 1 is not confirmed for `pos=`. The Mat34 setter
-was not searched, and the loopback transport was not added, because both
-were gated on `pos=` tracking.
+forward do not. The double3 is the world position. The Mat34 is not.
+
+### Setter search (2026-10-21, Ghidra `-noanalysis`, no re-analysis)
+
+The question was who stores the three qwords the walk moved. The getter
+pair was re-read first, then a byte scan of `.text` for stores of
+`+0xD8` followed by `+0xE0` and `+0xE8`, then a decompile of every hit
+that was a scalar double store or that sat next to the `+0x298` lock.
+
+Functions read, and what each one actually writes:
+
+- `FUN_140962590` (RVA `0x962590`, 161 bytes) and `FUN_140962640`
+ (RVA `0x962640`, 235 bytes) only **load** the three qwords. Both take
+ the critical section at `entity+0x298`: `LEA RBX, [reg+0x298]`,
+ `TryEnterCriticalSection`, `EnterCriticalSection` if that fails, copy,
+ `LeaveCriticalSection`. Neither stores the field. Their only callers
+ are the script-export registrar `FUN_1409476e0` (the `LEA`s at
+ `0x9486E6` and `0x9486FE`) and data pointers. They are not the writer.
+- `FUN_140948a10` (RVA `0x948a10`, 833 bytes) is the entity constructor.
+ At RVA `0x948AEE` / `0x948AF5` / `0x948AFC` it does
+ `MOV [RCX+0xD8], RBP`, `MOV [RCX+0xE0], RBP`, `MOV [RCX+0xE8], RBP`
+ with RBP = 0, then `vmovups [RCX+0xF0], ymm0` from the identity matrix
+ at `0x141fdffd0` and `MOV [RCX+0x110], EAX`. It does not take the
+ `+0x298` lock. This is the zeroing, not the per-frame update.
+- `FUN_141274ae0` (RVA `0x1274ae0`, 538 bytes), called from
+ `FUN_141274640`, copies one record onto another: `vmovsd xmm0,
+ [RDI+0xD8]` then `vmovsd [RBX+0xD8], xmm0` at RVA `0x1274B90`, then
+ `[RDI+0xE0]` as a dword and `vmovups ymm` from `[RDI+0xE8]`. No
+ `+0x298` lock. It is a clone of the record, not the sim that advances
+ the player.
+- `FUN_1410b9a00` (RVA `0x10b9a00`) `vmovsd [RDI+0xD8], xmm0` at
+ `0x10B9A92` is inside a 0x100-byte element copy loop. The `+0xE0` store
+ is a dword and `+0xE8` is a pointer with a refcount increment. Not the
+ player double3.
+- `FUN_14119c470` (RVA `0x119c470`, 4649 bytes) and `FUN_1412c3c30`
+ (RVA `0x12c3c30`, 2138 bytes) `vmovsd` a triple at `[RBP+0xD8]`. RBP
+ is the frame pointer; the disassembly around the site is other
+ `RBP+` spills (`-0x60`, `+0x100`, `+0x108`). Stack, not the entity.
+- `FUN_140f53f40` (RVA `0xf53f40`, 3695 bytes) was the only site whose
+ `+0xD8` store sat within 0x80 bytes of a `+0x298` displacement and was
+ followed by a `+0xF0` store. The `+0x298` use is `vminsd xmm6, xmm11,
+ [RBP+0x298]`, a stack slot, and the `vmovsd [RBP+0xD8], xmm0` at
+ `0xF549E7` writes a zeroed xmm. Not the entity lock.
+
+No function was found that stores `entity+0xD8/+0xE0/+0xE8` and takes
+the `entity+0x298` lock. The per-frame writer is not one of the
+functions above. A direct write of the three qwords is the remaining
+way to move a second instance; calling `FUN_140962590` or
+`FUN_140962640` from an injected thread would only read, and it would
+take a lock the game's own thread also takes.
+
+### Player slots
+
+`GetLocalPlayer` (`FUN_140928430`) copies out the whole list at
+`pm+0x08` (count) / `pm+0x10` (pointer array). `FUN_140916a80`, which
+`FUN_140916bf0` calls to get the entity, indexes a second array at
+`param+0x10 + index*0x10` with a count at `param+0x08 + index*0x10`,
+and returns `player+0x48` only for the matching entry. So `pm+0x08` is
+a real count, not a hard-coded 1. Whether a second player object is
+ever constructed in single-player was not observed. A puppet that
+reuses the one live entity would move the owner's player.
+
+### Probe retarget (2026-10-21)
+
+`hfw_probe.c` now logs the double3 as `pos=(x,y,z)` in metres.
+`sane=1` only when all three are finite and inside ±1e7. The Mat34
+translation is a `mat=` column and does not set `sane=`. `counter=`
+and the hash guard are unchanged. Still read-only, 10 Hz, one `memcpy`
+per field inside SEH, flush at most once a second.
+
+`hfw_loopback.c` exchanges one 48-byte datagram on `127.0.0.1` only
+(both sockets bound to `INADDR_LOOPBACK`, ephemeral port, never
+`INADDR_ANY`). Layout: three doubles of position, then three doubles
+of forward. No game process.
+
+Offline, this session:
+
+```
+hfw_loopback.exe
+LOOPBACK OK 127.0.0.1:<ephemeral> 48 bytes pos=(5991.074,-2886.996,334.957) fwd=(0.000,0.000,1.000)
+
+dotnet run --project probe/hfw-probe.csproj -c Release -- --selftest <exe>
+14/14 PASS, SELFTEST OK
+```
+
+The new anchors are the double3 loads inside `FUN_140962640`
+(`C5 F8 10 87 D8 00 00 00` at RVA `0x962681`, `C5 FB 10 8F E8 00 00 00`
+at `0x962689`) and the constructor's zeroing store at `0x948AEE`.
 
 ## Not tried (next session)
-
-- Find who stores the three doubles at `entity+0xD8/+0xE0/+0xE8`. That
- is the read that moved while the owner walked. Do not treat the Mat34
- at `entity+0xF0` as the live world position on this evidence, and do
- not call a setter. The probe does not need another inject to show this;
- the copied log is the evidence.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).

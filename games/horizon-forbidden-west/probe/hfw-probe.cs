@@ -29,14 +29,11 @@
 // player = [storage]
 // +0x48 Entity* (FUN_140916bf0)
 // entity
-// entity+0xD8 is three qwords (FUN_140d4f750 copies +0xD8/+0xE0/+0xE8).
-// The live 2026-10-21 log showed those are not a position.
-// The world transform is the Mat34 at entity+0xF0 (0x3C bytes, 3x4 floats,
-// row-major). Entity_ExportedGetWorldTransform is bound by FUN_14095bfb0
-// to FUN_140962640, which copies that matrix under the lock at entity+0x298.
-// Translation is the last row (+0x114/+0x118/+0x11C). Forward is row 2.
-// [[scene+0x248]] counted 0x2280 -> 0x32AC on that run: a counter, not a
-// world id. No stable world id was found.
+// World position is the double3 at entity+0xD8/+0xE0/+0xE8. The walk run
+// (local/hfw-probe-run2.log) tracked it; the Mat34 translation at
+// entity+0xF0 did not. FUN_140962590 copies those three qwords under the
+// lock at entity+0x298. The probe reads them and does not take the lock.
+// The Mat34 stays a side column. [[scene+0x248]] is a counter, not a world id.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -55,7 +52,7 @@ internal static class Program
  private const int OffListCount = 0x08;
  private const int OffListStorage = 0x10;
  private const int OffPlayerEntity = 0x48;
- private const int OffEntityOld = 0xD8;
+ private const int OffEntityPos = 0xD8;
  private const int OffEntityMat = 0xF0;
  private const int OffSceneCounter = 0x248;
 
@@ -215,15 +212,15 @@ internal static class Program
  if (entity == 0)
  return $"frame counter={world} player=0x{player:X} entity=null";
 
- var raw = ReadBytes(handle, entity + OffEntityOld, 24);
+ var raw = ReadBytes(handle, entity + OffEntityPos, 24);
  var mat = ReadBytes(handle, entity + OffEntityMat, 60);
- var tx = BitConverter.ToSingle(mat, 0x24);
- var ty = BitConverter.ToSingle(mat, 0x28);
- var tz = BitConverter.ToSingle(mat, 0x2C);
- var hx = BitConverter.ToSingle(mat, 0x18);
- var hy = BitConverter.ToSingle(mat, 0x1C);
- var hz = BitConverter.ToSingle(mat, 0x20);
- return $"frame counter={world} entity=0x{entity:X} pos=({tx:F3},{ty:F3},{tz:F3}) fwd=({hx:F3},{hy:F3},{hz:F3}) old={BitConverter.ToString(raw)}";
+ var x = BitConverter.ToDouble(raw, 0);
+ var y = BitConverter.ToDouble(raw, 8);
+ var z = BitConverter.ToDouble(raw, 16);
+ var mx = BitConverter.ToSingle(mat, 0x24);
+ var my = BitConverter.ToSingle(mat, 0x28);
+ var mz = BitConverter.ToSingle(mat, 0x2C);
+ return $"frame counter={world} entity=0x{entity:X} pos=({x:F3},{y:F3},{z:F3}) mat=({mx:F3},{my:F3},{mz:F3})";
  }
 
  private static string WorldId(nint handle, ulong scene)
@@ -294,8 +291,9 @@ internal static class Program
  ("GetLocalPlayer fn", 0x928430, "4C 8B DC 49 89 73 18 57 48 83 EC 30"),
  ("PlayerManagerGame vftable", 0x18FBE60, "30 CA D5 40 01 00 00 00"),
  ("SceneManagerGame vftable", 0x18FB458, "70 92 AA 40 01 00 00 00"),
- ("entity qword read (old)", 0xD4F8D4, "C5 F8 10 B5 D8 00 00 00"),
- ("entity qword read 2 (old)", 0xD4F8DC, "C5 FB 10 BD E8 00 00 00"),
+ ("double3 load +0xD8", 0x962681, "C5 F8 10 87 D8 00 00 00"),
+ ("double3 load +0xE8", 0x962689, "C5 FB 10 8F E8 00 00 00"),
+ ("ctor zeroes +0xD8", 0x948AEE, "48 89 A9 D8 00 00 00"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  };
