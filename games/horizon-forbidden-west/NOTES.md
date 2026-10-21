@@ -1,12 +1,11 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5 milestone 1 probed live** (2026-10-21) — second run,
-450/450 samples, `sane=1`, `pos=(0.000,-26340.094,5.732)` frozen because
-the console loader paused the game. The loader is now a windowless
-`WinExe`. Offline selftest 13/13.
-Runtime injection is blocked: Steam has no library entry for this install, so
-`-applaunch` does not start the game. Manual steps below. Claim issue:
-cranebeaker/coop-anything#83. Route **(c)** — see [DECISION.md](DECISION.md).
+Status: **phase 5 milestone 1 not confirmed** (2026-10-21) — third live
+run, owner walking in borderless windowed. `pos=` (Mat34 translation) did
+**not** track movement. The side-column doubles at `entity+0xD8` did.
+Route **(c)** stays blocked on a position read. Do not write the Mat34
+and do not spawn a puppet from this offset. Claim issue:
+cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 ## Game identity (observed, verified this session)
 
@@ -523,13 +522,69 @@ To run it:
  because the game was paused for the whole sample.
 4. Close the game. Do not leave it running.
 
+### Runtime test 3 (2026-10-21, owner walking, borderless)
+
+The owner confirmed the earlier freeze was a pre-existing fullscreen
+focus bug, switched the game to borderless windowed, and ran
+`hfw-probe.exe --exe <game dir>\HorizonForbiddenWest.exe --seconds 45`
+from `probe\bin\Release\net10.0`. The loader is a `WinExe`, so it printed
+nothing and returned immediately; that is not a failed inject. About 45 s
+later `<game dir>\hfw-probe.log` was written. The log was copied to
+`local/hfw-probe-run2.log` and parsed there. The game directory was not
+written. The game was not launched from here.
+
+452 lines: start, 450 samples, stop. `faults=0` (the stop line is the
+only line containing the word `fault`). One entity for all 450 samples,
+`0x25700154D00`. `counter=` climbed `0xAEA0 -> 0xC5FC` (+5980, no
+decreases, per-sample delta 4..20). `fwd=(0.000,0.000,1.000)` on every
+sample, sane or not.
+
+`pos=` did **not** track the walk:
+
+- `sane=1` on 280 samples, `sane=0` on 170. `sane=0` is the Y float
+ outside ±1e7 (up to ~1e38). X is `0.000` on all 450. Z only wobbles
+ `5.731..5.734` (3 mm). Forward never changes.
+- The 280 sane samples are not a path. The longest sane run is samples
+ 0..87, `pos` identical at `(0.000,-0.000,5.732)`. Later sane Y values
+ include `-8158409` and `2730540.5` between samples that are ~0, which
+ is a torn float, not metres walked. First sane to last sane is 2.6 cm,
+ and that centimetre is the same Z wobble.
+- Quoted first, a mid sample, and last. The mid line is the first sane
+ sample whose Y differs; it is not a position along a path:
+
+```
+sample=0 counter=0x0000AEA0 entity=0x25700154D00 pos=(0.000,-0.000,5.732) fwd=(0.000,0.000,1.000) sane=1 old=40B76E8999883B80 C0A68DFDB9AE304C 4074F50991243420
+sample=99 counter=0x0000B190 entity=0x25700154D00 pos=(0.000,-1.028,5.732) fwd=(0.000,0.000,1.000) sane=1 old=40B77050DFAFD6D7 C0A682E3085CE41C 4074F1EC654373BC
+sample=449 counter=0x0000C5FC entity=0x25700154D00 pos=(0.000,-0.026,5.731) fwd=(0.000,0.000,1.000) sane=1 old=40B7665FAB0947C3 C0A68205CBF3B27F 4074F1833DCB5309
+```
+
+What did move is `old=`, the three qwords at `entity+0xD8/+0xE0/+0xE8`
+read as little-endian doubles. All 450 are finite and inside ±1e7.
+They sit still through sample 87 (same place as the paused run's
+`(5994.304,-2919.780,335.282)`), then move:
+
+- min/max X `5990.370 .. 6009.283` (range 18.914)
+- min/max Y `-2886.996 .. -2853.557` (range 33.439)
+- min/max Z `334.798 .. 336.771` (range 1.973)
+- straight-line first→last `10.125` m; farthest point from the start
+ `33.934` m at sample 219; path length `110.690` m; max step `1.188` m
+ per 100 ms sample. 184 steps under 1 cm, 237 steps of at least 5 cm.
+ 19 / 18 / 34 sign changes on X / Y / Z. That is a walk, not a counter.
+
+`FUN_140962640` copies those three qwords in the same locked read as the
+Mat34. The paused run could not tell them apart because both were still.
+This run separates them: the doubles move, the Mat34 translation and
+forward do not. Milestone 1 is not confirmed for `pos=`. The Mat34 setter
+was not searched, and the loopback transport was not added, because both
+were gated on `pos=` tracking.
+
 ## Not tried (next session)
 
-- Runtime confirmation that `pos=` tracks a walking player. `sane=1` is
- confirmed, and the Mat34 row is the export's row. The second live run
- sampled a paused player (`pos=` fixed, `counter=` still climbing),
- because the console loader stole focus. The loader is now a windowless
- `WinExe`; the next run has to be done while walking.
+- Find who stores the three doubles at `entity+0xD8/+0xE0/+0xE8`. That
+ is the read that moved while the owner walked. Do not treat the Mat34
+ at `entity+0xF0` as the live world position on this evidence, and do
+ not call a setter. The probe does not need another inject to show this;
+ the copied log is the evidence.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
