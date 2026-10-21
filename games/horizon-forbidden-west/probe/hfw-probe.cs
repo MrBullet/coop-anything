@@ -67,27 +67,56 @@ internal static class Program
 
  public static int Main(string[] args)
  {
- if (args.Length > 0 && args[0] == "--selftest")
+ try
  {
- return SelfTest(args.Length > 1 ? args[1] : DefaultExe());
+ return Run(args);
  }
+ catch (Exception ex)
+ {
+ Note("EXCEPTION: " + ex.GetType().Name + ": " + ex.Message);
+ return 1;
+ }
+ }
+
+ private static int Run(string[] args)
+ {
+ Note("args=[" + string.Join(" | ", args) + "]");
+ if (HasFlag(args, "--selftest"))
+ {
+ var selfExe = Arg(args, "--selftest");
+ if (string.IsNullOrEmpty(selfExe))
+ {
+ var idx = Array.IndexOf(args, "--selftest");
+ selfExe = (idx >= 0 && idx + 1 < args.Length) ? JoinPath(args, idx + 1) : DefaultExe();
+ }
+ if (string.IsNullOrEmpty(selfExe)) selfExe = DefaultExe();
+ Note("selftest exe=" + selfExe);
+ return SelfTest(selfExe);
+ }
+
+ var spawnOnce = HasFlag(args, "--spawn-once");
+ Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
 
  var exe = Arg(args, "--exe") ?? DefaultExe();
  var seconds = int.TryParse(Arg(args, "--seconds"), out var s) ? s : 45;
- var spawnOnce = HasFlag(args, "--spawn-once");
+ Note("exe=" + exe);
 
  if (!Guard(exe, out var why))
  {
+ Note("hash fail " + why);
  Note("REFUSED: " + why);
  return 2;
  }
+ Note("hash ok " + ExpectedSha256 + " stamp=667B1777-949F000");
 
  var proc = Process.GetProcessesByName("HorizonForbiddenWest").FirstOrDefault();
  if (proc is null)
  {
+ Note("process not found");
  Note("REFUSED: HorizonForbiddenWest.exe is not running.");
  return 3;
  }
+ Note($"process found pid={proc.Id}");
 
  var dll = Arg(args, "--dll") ?? Path.Combine(AppContext.BaseDirectory, "hfw_probe.dll");
  if (!File.Exists(dll))
@@ -103,9 +132,11 @@ internal static class Program
  var injected = Inject(proc.Id, Path.GetFullPath(dll), spawnOnce, out var whyNot);
  if (!injected)
  {
+ Note("inject fail " + whyNot);
  Note("REFUSED: inject failed: " + whyNot);
  return 4;
  }
+ Note(spawnOnce ? "injected mode=spawn-once" : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
  // ASFW_ANY lets the game call SetForegroundWindow and take focus back.
@@ -138,7 +169,24 @@ internal static class Program
  {
  }
  var path = Path.Combine(AppContext.BaseDirectory, "hfw-probe-run.txt");
- File.AppendAllText(path, line + "\r\n");
+ var bytes = Encoding.UTF8.GetBytes(line + "\r\n");
+ for (var attempt = 0; attempt < 8; attempt++)
+ {
+ try
+ {
+ using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+ fs.Write(bytes, 0, bytes.Length);
+ return;
+ }
+ catch (IOException)
+ {
+ Thread.Sleep(30);
+ }
+ catch (UnauthorizedAccessException)
+ {
+ return;
+ }
+ }
  }
 
  private const uint ProcessCreateThread = 0x0002;
@@ -375,11 +423,29 @@ internal static class Program
  Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..",
  "local", "workspace", "hfw-binaries", "HorizonForbiddenWest.exe");
 
+ // Start-Process -ArgumentList '--exe','M:\Horizon Forbidden West\...'
+ // splits the path on spaces before the exe sees it. Rejoin until the next flag.
+ private static bool IsFlag(string a) => a.StartsWith("--", StringComparison.Ordinal);
+
  private static string? Arg(string[] args, string name)
  {
  for (var i = 0; i < args.Length - 1; i++)
- if (args[i] == name) return args[i + 1];
+ {
+ if (args[i] != name) continue;
+ return JoinPath(args, i + 1);
+ }
  return null;
+ }
+
+ private static string JoinPath(string[] args, int start)
+ {
+ var parts = new List<string>();
+ for (var j = start; j < args.Length; j++)
+ {
+ if (IsFlag(args[j])) break;
+ parts.Add(args[j]);
+ }
+ return parts.Count == 0 ? "" : string.Join(" ", parts);
  }
 
  private static bool HasFlag(string[] args, string name)

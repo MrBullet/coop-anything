@@ -854,15 +854,74 @@ A second body is the milestone after a log that shows `count=1` then
 `count=2`. Driving that body's double3 from a received pose is the
 step after that, and it is still not the owner's entity.
 
+### Runtime test 4 (2026-10-21, owner, --spawn-once, no log)
+
+The owner deleted `<game dir>\hfw-probe.log`, then from
+`probe\bin\Release\net10.0`:
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','M:\Horizon Forbidden West\HorizonForbiddenWest.exe','--spawn-once'
+```
+
+The shell returned immediately. The game stayed playable. The log was
+not recreated. That is not a silent inject.
+
+The binary they launched is the spawn-once build, not an older exe.
+`hfw-probe.exe` LastWriteTime 2026-10-21 15:59:39, `hfw_probe.dll` in
+that folder 15:57:56, source `hfw_probe.c` 15:58:10 and `hfw-probe.cs`
+15:56:42. The native DLL contains `spawn-once after`. The managed
+`hfw-probe.dll` contains `--spawn-once` as UTF-16 (the apphost exe does
+not; .NET strings live in the managed DLL). Subsystem is still 2.
+
+Evidence is `hfw-probe-run.txt` beside that exe (written 16:03:41):
+
+```
+REFUSED: exe not found: M:\Horizon
+```
+
+`Start-Process -ArgumentList` with commas is a string array. Windows
+PowerShell 5.1 splits each element on spaces before the child sees it,
+so the loader received `--exe`, `M:\Horizon`, `Forbidden`, `West\HorizonForbiddenWest.exe`,
+`--spawn-once`. `Arg` took only the next token. `Guard` failed on a
+path that does not exist, `Note` wrote the refusal, and `Main` returned
+2. No inject, no `hfw_probe.dll.mode`, no game log. The game kept
+running because nothing was loaded into it. The two older lines in the
+same sidecar are earlier runs (one 45 s inject, one more split path).
+
+The loader now rejoins tokens after `--exe` / `--dll` / `--selftest`
+until the next `--` flag, so the comma form and a quoted path both
+work. Every exit writes to `hfw-probe-run.txt` next to the exe:
+`spawn flag seen` or `spawn flag absent`, `process found pid=N` or
+`process not found`, `hash ok` or `hash fail`, `injected` or
+`inject fail`, and `EXCEPTION:` if anything throws before that.
+The hash guard is unchanged. `--spawn-once` still waits for
+`[pm+0x08] >= 1`, calls `FUN_14134c950` once inside SEH with a zero
+argument, and does not store the double3.
+
+The rebuilt loader was then started once, by mistake, while the game
+was already open, to check the rejoin. It did inject. The game log
+(copied here, not left as the only copy) is three lines:
+
+```
+spawn-once start call=FUN_14134c950 no-pose-write
+spawn-once before count=1 storage=0x1FF952101E0
+spawn-once after called=0 code=0xC0000005 count=1 storage=0x1FF952101E0 delta=0 faults=1
+```
+
+`count` stayed 1. `0xC0000005` is the SEH access violation inside
+`FUN_14134c950`. The call returned. That is not `count=2`. Do not
+treat this as the milestone. The owner should alt-f4 if the game is
+wedged, then rerun the command below on a freshly loaded save.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2: a second entity. The call is in the probe as
- `--spawn-once` (see "Spawn call convention" above). It has not been
- run against a live game. Do not write the double3 until a log shows
- `[pm+8]` going from 1 to 2. Do not call `FUN_14101bd70`; it takes
- `entity+0x298`, which the sim thread also takes.
+- Milestone 2: a second entity. One live call of `FUN_14134c950` from
+ the injected thread faulted (`0xC0000005`) with `count` still 1.
+ Do not write the double3. Do not call `FUN_14101bd70`. The next
+ step is why that call faults on an injected thread (TLS fallback
+ noted above), not another blind call.
 
 ## Sources
 
