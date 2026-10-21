@@ -714,16 +714,85 @@ The new anchors are the double3 loads inside `FUN_140962640`
 (`C5 F8 10 87 D8 00 00 00` at RVA `0x962681`, `C5 FB 10 8F E8 00 00 00`
 at `0x962689`) and the constructor's zeroing store at `0x948AEE`.
 
+### Who inserts into the player list (2026-10-21, Ghidra `-noanalysis`)
+
+The count at `pm+0x08` is not written by a function that names the
+global. It is written by a shared vector push, and the only function
+that calls that push with `pm+8` is a `PlayerManagerGame` virtual.
+
+The store. `FUN_1402250c0` (RVA `0x2250C0`, 168 bytes) is the push.
+`MOV EDI, [RCX]` / `INC EDI` at `0x2250D0`, then when the count exceeds
+the capacity dword at `+0x04` it reallocates the pointer at `+0x08`
+through `FUN_1401e6260` and stores it back (`MOV [RBX+8], R8` at
+`0x225131`). The element store is `MOV [R8+RCX*8], RAX` at `0x22514A`.
+The count store is `MOV [RBX], ECX` at `0x22515A` (`89 0B`). Layout of
+the argument is count / capacity / pointer, so a caller that passes
+`pm+8` grows exactly the list `GetLocalPlayer` copies.
+
+The caller that passes `pm+8`. `PlayerManagerGame::vftable` is at RVA
+`0x18FBE60`. Slot `+0x08` (RVA `0x18FBE68`) is `FUN_140d8c2d0`
+(`0xD8C2D0`, 554 bytes); slot `+0x10` is the matching remove
+`FUN_140d8c500`. `FUN_140d8c2d0(pm, player)` refcounts the record and
+pushes it:
+
+- always into `pm+0x38` (`LEA RCX, [RSI+0x38]` / `CALL 0x1402250c0`
+ at `0xD8C2FF`) — the "all players" vector,
+- into `pm+0x28` if `player->vfunc+0x68` is true (`0xD8C320`),
+- into `pm+0x18` if `player->vfunc+0x60` is true (`0xD8C34A`),
+- into `pm+0x08` otherwise (`LEA RCX, [RSI+8]` / `CALL 0x1402250c0`
+ at `0xD8C38A`).
+
+`pm+0x08` is the list `FUN_140928430` copies and `FUN_140916a80`
+indexes, so the third arm is the one that adds a body the local-player
+lookup can see. After the push it calls `FUN_140916c20`, which walks
+`pm+0x10` and caches the first live entry at `pm+0x48`. The remove
+slot does not call the push; it calls `FUN_140916820`, which scans
+each of the four vectors and decrements the count.
+
+What gets inserted. Not the entity from `FUN_140948a10`, and not the
+clone `FUN_141274ae0`. The argument is a `PlayerGame` record. Its
+constructor is `FUN_140d73270` (`0xD73270`, 416 bytes): it calls
+`FUN_140913be0` (which writes `Player::vftable` at `+0x00` and `+0x20`,
+VA `0x1418AA868` / `0x1418AAEE8`) and then writes `PlayerGame::vftable`.
+`param_1[6]` of that record is the entity argument, which is where
+`player+0x48` comes from — the same offset `FUN_14101bd70` reads. The
+entity itself is still built by `FUN_140948a10` elsewhere; this insert
+only takes the pointer.
+
+Call chain, single-player. `FUN_14134c590` (`0x134C590`) calls
+`FUN_14134c950` (`0x134C950`) and then walks `[pm+0x10]` / `[pm+8]`,
+so it runs against the live manager. `FUN_14134c950` allocates with
+`FUN_1401e6100` at `0x134CA82` and constructs with `FUN_140d73270` at
+`0x134CA90` (and again at `0x134CAA8` on the zero-size path). At the
+bottom, `0x134CF23` loads the global (`MOV RCX, [0x148982C80]`) and
+`0x134CF30` does `CALL [RAX+8]` with the new `PlayerGame` in `RSI` —
+that is `FUN_140d8c2d0`. Both functions are only referenced from
+vtables (`0x1980FF8` for `FUN_14134c590`), not from
+`NetSessionManagerNoOp` and not from the stripped `NetSessionManager`.
+The `MsgRemotePlayerJoined` post inside `FUN_140d8c2d0` is a side
+effect after the push, gated on `[[0x148983150]+0x178]`; it is not the
+insert. A second path, `FUN_1413d8630`, calls the same virtual but its
+only references are data (`0x1980B40`), so it is not the live one.
+
+So the path is reachable from a live system, not only from the dead
+net layer. It is a virtual on a vtable, which is why it has no direct
+`CALL` xref — the call site is the indirect `CALL [RAX+8]` above.
+Calling it from an injected thread is the next step, and it was not
+called here.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2: a second entity. There is no spawn path that constructs
- one (`FUN_140948a10` callers never touch `PlayerManagerGame*`), so the
- next step is to find who inserts into `pm+0x08` / `pm+0x10` and call
- that with a second `Humanoid`. Until then, writing `FUN_14101bd70`'s
- target moves the owner. Do not call the writer from an injected thread;
- it takes `entity+0x298`, which the sim thread also takes.
+- Milestone 2: a second entity. The insert is found (see "Who
+ inserts into the player list" above): `FUN_14134c950` builds a
+ `PlayerGame` with `FUN_140d73270` and calls
+ `PlayerManagerGame::vftable+8` (`FUN_140d8c2d0`), which pushes it
+ into `pm+0x08` through `FUN_1402250c0`. Next is to call that path
+ once, from the probe, and confirm `[pm+8]` goes from 1 to 2. Do not
+ write the double3 until that second entry is observed. Do not call
+ `FUN_14101bd70`; it takes `entity+0x298`, which the sim thread also
+ takes.
 
 ## Sources
 

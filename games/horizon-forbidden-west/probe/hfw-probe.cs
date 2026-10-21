@@ -295,6 +295,10 @@ internal static class Program
  ("double3 load +0xE8", 0x962689, "C5 FB 10 8F E8 00 00 00"),
  ("ctor zeroes +0xD8", 0x948AEE, "48 89 A9 D8 00 00 00"),
  ("writer store +0xD8", 0x101C83F, "C4 C1 7B 11 B6 D8 00 00"),
+ // FUN_140d8c2d0 is PlayerManagerGame::vftable+8. This is the arm
+ // that pushes into pm+8: LEA RCX,[RSI+8]; MOV [RSP+0x78],RBX;
+ // LOCK INC [RBX+0x18]; LEA RDX,[RSP+0x78]; CALL FUN_1402250c0.
+ ("player-list insert pm+8", 0xD8C381, "48 8D 4E 08 48 89 5C 24 78 F0 FF 43 18 48 8D 54 24 78 E8 28 8D 49 FF"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  };
