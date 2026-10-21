@@ -1,16 +1,15 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, ADD-PLAYER UNBLOCKED** (2026-10-21) — `--add-player`
-is a one-shot. It waits until `GameModule*`, `[module+0x50]`, the
-entity at `[[module+0x50]+0x20]`, `[0x148982CB0]` and the player count
-at `[PlayerManager+8]` are all non-null / `>= 1`, logs them, then
-calls `FUN_1401e6100(0x210)` once, `FUN_140d73270(block, entity)` once
-and `FUN_1402250c0(pm+8, &slot)` once, and exits. It does not call
+Status: **phase 5, ADD-PLAYER ALLOC ONLY** (2026-10-21) — `--add-player`
+is a one-shot that stops after `FUN_1401e6100(0x210)`. It does not
+call `FUN_140d73270` and it does not call `FUN_1402250c0`, so it does
+not insert into the player list and it does not publish the block
+onto the camera manager. The count stays 1. It does not call
 `FUN_1413d8470`, `FUN_14134c950` or `FUN_14101bd70`, and it does not
-write `entity+0xD8`. `--read-cam` and `--read-slot` stay read-only.
-`--spawn-once` still does not call `FUN_14134c950`. Default is still
-the 45 s sampler. Claim issue: cranebeaker/coop-anything#83. See
-[DECISION.md](DECISION.md).
+write `entity+0xD8`. No second character. `--read-cam` and
+`--read-slot` stay read-only. `--spawn-once` still does not call
+`FUN_14134c950`. Default is still the 45 s sampler. Claim issue:
+cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 The BSS qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
@@ -1672,6 +1671,119 @@ prologues the one-shot calls: `FUN_1401e6100` at `0x1E6100`
 (`48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58`) and
 `FUN_1402250c0` at `0x2250C0`
 (`48 89 5C 24 18 48 89 7C 24 20 41 56`).
+
+### `--add-player` crashed after the insert (2026-10-21, owner's log)
+
+The owner ran the unblocked one-shot, tabbed back to the game, and
+the game crashed. SEH on the probe thread saw nothing: alloc, ctor
+and the list push all returned, and the count store landed. Copied
+read-only from the game directory to `local/hfw-probe-addplayer.log`:
+
+```
+add-player start one-shot gate=GameModule@0x8983150 plus50 entity cam count>=1
+add-player gate module=0x21C7CE32A00 plus50=0x2180BBB94D0 entity=0x21811717280 cam=0x21CD7933700 pm=0x21CF0884520 count=1 waited_s=0 faults=0
+add-player alloc block=0x21D42380000 seh=0x00000000
+add-player ctor built=0x21D42380000 seh=0x00000000
+add-player stop count=2 seh=0x00000000 block=0x21D42380000
+```
+
+`probe\bin\Release\net10.0\hfw-probe-run.txt` was not present. The
+inserted record is the `PlayerGame` at `0x21D42380000`. `FUN_140913be0`
+stores the entity argument at `[this+0x30]` (`MOV [RDI+0x30], RBX` at
+RVA `0x913CB7`), and the argument was the live entity
+`0x21811717280`, so two `PlayerGame` records point at the owner's
+entity. `[PlayerGame+0xE8]` is still zero: `FUN_1413d8470` is what
+writes the `NetPlayerGame` there, and it was not called.
+
+Offline only after that log. One Ghidra `-noanalysis -readOnly
+-process` pass (`local/ghidra_scripts/ListWalk.java`,
+`CamInsert.java`, `PgVtable.java`, `PgSlots.java`; reports
+`local/list_walk.txt`, `local/cam_insert.txt`, `local/pg_vtable.txt`,
+`local/pg_slots.txt`). No re-analysis, no symbol scan, no inject, no
+launch, nothing written under `M:\`.
+
+Who walks the list the push grew. `FUN_1402250c0` itself only copies
+the pointer (`MOV [R8+RCX*8], RAX` at `0x22514A`) and stores the count
+(`MOV [RBX], ECX` at `0x22515A`). It does not read the record. The
+readers of `pm+8` / `pm+0x10`:
+
+`FUN_140916a80` (RVA `0x916A80`, the lookup `FUN_140916bf0` calls) at
+RVA `0x916AC8`:
+
+```
+MOV RAX, [R8+0xE8]
+TEST RAX, RAX
+JZ 0x140916ade
+```
+
+`FUN_140916c20` (RVA `0x916C20`, called at the bottom of the real
+insert `FUN_140d8c2d0`) at RVA `0x916C43`:
+
+```
+MOV RCX, [RAX+0xE8]
+TEST RCX, RCX
+JZ 0x140916c55
+```
+
+Both loads of `[PlayerGame+0xE8]` are behind a null test, and the
+null arm only reads the byte at `[PlayerGame+0x58]`, which
+`FUN_140913be0` zeroes at `0x913C42`. So a missing `NetPlayerGame`
+does not fault these two. The same `TEST` / `JZ` shape is what the
+`PlayerGame` virtuals do: `vftable+0x38` is `FUN_140d75980`, and
+`MOV RAX, [RSI+0xE8]` at `0xD75A05` is followed by `TEST RAX, RAX` /
+`JZ` at `0xD75A0C`. `+0x40` (`FUN_140d75c40`, `0xD75C8F`) and `+0x50`
+(`FUN_140d753e0`, `0xD75418`) are the same. No field already in hand
+fills `+0xE8`; the only writer is `FUN_1413d8470`, which is still not
+called.
+
+The step that does not have a null arm is the constructor. Re-read
+from `FUN_140d73270`:
+
+```
+RVA 0xD73285 CALL 0x140913be0 ; stores RDX at [this+0x30]
+RVA 0xD7329A LEA R14, [RSI+0x130]
+RVA 0xD733C2 MOV RDI, [0x148982CB0]
+RVA 0xD733DC LEA RCX, [RDI+0x30]
+RVA 0xD733E0 CMOVZ R14, RBP ; RBP is 0, only if the block is null
+RVA 0xD733E4 MOV RDX, R14
+RVA 0xD733E7 CALL 0x1400fe310
+```
+
+`FUN_1400fe310` is the same vector push family as `FUN_1402250c0`.
+`RCX` is the camera manager's list at `+0x30` and `RDX` is the new
+`PlayerGame+0x130`. The `CMOVZ` only substitutes null when the block
+itself is null, which it was not (`built=0x21D42380000`). So the ctor
+returned with the owner's entity at `[PlayerGame+0x30]` and a second
+entry on the camera manager's list. That list is walked on the game's
+own thread, which is why the probe's SEH stayed at `0x00000000` and
+the crash came after the log line, when the owner tabbed back.
+
+Decision: **(b)**, and stricter than the list insert. The shared
+entity is published by the constructor, not by `FUN_1402250c0`, so
+stopping before the insert would leave the camera-list entry in
+place. `--add-player` now calls `FUN_1401e6100(0x210)` once, logs the
+block, and returns. It does not call `FUN_140d73270` and it does not
+call `FUN_1402250c0`. The block is a leak the game does not know
+about, so neither walk can see it. The count stays 1. No second
+character is expected. The list insert stays off until the
+`NetPlayerGame` link at `[PlayerGame+0xE8]` exists, and the
+constructor stays off until the entity at `[PlayerGame+0x30]` is not
+the owner's.
+
+Start a fresh game session first. The one that crashed is dead. Load
+a save, then from `probe\bin\Release\net10.0`:
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbiddenWest.exe','--add-player'
+```
+
+The line to look for is `add-player stop count=1 seh=0x00000000 block=0x`
+followed by `(ctor and insert not called`. Do not expect `count=2`.
+
+Selftest is 32/32 on the offline exe, including the two walker loads
+(`49 8B 80 E8 00 00 00` at `0x916AC8`, `48 8B 88 E8 00 00 00` at
+`0x916C43`) and the constructor's camera-list publish
+(`48 8D 4F 30 4C 0F 44 F5 49 8B D6 E8 24 AF 38 FF` at `0xD733DC`).
 
 ## Sources
 

@@ -25,13 +25,16 @@
 // Waits until GameModule*, [module+0x50], the entity at
 // [[module+0x50]+0x20], [0x148982CB0] and the player count at
 // [PlayerManager+8] are all non-null / >= 1, logs them, then calls
-// FUN_1401e6100(0x210) once, FUN_140d73270(block, entity) once and
-// FUN_1402250c0(pm+8, &slot) once. The vtable calls inside
-// FUN_140d8c2d0 are not emitted. FUN_1413d8470, FUN_14134c950 and
-// FUN_14101bd70 are not called, and entity+0xD8 is not written.
-// The constructor takes AcquireSRWLockExclusive on the camera
-// manager; that can hitch if the game holds the lock. A success
-// line is "add-player stop count=2 seh=0x00000000".
+// FUN_1401e6100(0x210) once and stops. It does not call FUN_140d73270:
+// that constructor stores the live entity at [block+0x30] and pushes
+// the block onto the camera manager's list, so the next tick drives
+// the owner's entity a second time. It does not call FUN_1402250c0:
+// the list walkers (FUN_140916a80 at RVA 0x916AC8, FUN_140916c20 at
+// RVA 0x916C43) load [PlayerGame+0xE8], which FUN_1413d8470 writes
+// and this probe does not. The count stays 1. FUN_1413d8470,
+// FUN_14134c950 and FUN_14101bd70 are not called, and entity+0xD8 is
+// not written. No second character. The line to look for is
+// "add-player stop count=1 seh=0x00000000 block=0x.. (ctor and insert not called".
 // --spawn-once and --read-slot are unchanged.
 //
 // --read-cam: opt-in. Mode byte 4. Same gate as --read-slot (GameModule*
@@ -218,12 +221,14 @@ internal static class Program
  if (addPlayer)
  {
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=add-player. " +
- "one shot: FUN_1401e6100, FUN_140d73270, FUN_1402250c0, then exit. " +
- "FUN_1413d8470 and FUN_14134c950 are not called. entity+0xD8 is not written. " +
+ "one shot: FUN_1401e6100 only, then exit. FUN_140d73270 and " +
+ "FUN_1402250c0 are not called. FUN_1413d8470 and FUN_14134c950 are not called. " +
+ "entity+0xD8 is not written. the player list is not touched and the count stays. " +
  "log is hfw-probe.log in the game's working directory. " +
- "load a save first. AcquireSRWLockExclusive inside the constructor can hitch; " +
- "alt-f4 if the game wedges. a success line is 'add-player stop count=2 seh=0x00000000'. " +
- "this does not write the player's position.");
+ "start a fresh session, load a save first. " +
+ "the line to look for is 'add-player stop count=1 seh=0x00000000 block=0x' " +
+ "followed by '(ctor and insert not called'. " +
+ "no second character. this does not write the player's position.");
  return 0;
  }
  if (readCam)
@@ -464,7 +469,8 @@ internal static class Program
  ("spawn alloc size", 0x21615A0, "10 02 00 00"),
  // FUN_1401e6100 at the NetPlayerGame site. RCX is the size
  // (MOVSXD RCX,EDX), not a type-record pointer. --add-player calls
- // this entry with RCX=0x210, then FUN_140d73270, then FUN_1402250c0.
+ // this entry with RCX=0x210 and then stops. It does not call
+ // FUN_140d73270 or FUN_1402250c0.
  ("alloc call site", 0x13D852B, "48 63 CA E8 CD DB E0 FE"),
  // FUN_140d73270(RDI, RSI) immediately after that alloc.
  ("ctor call site", 0x13D853A, "48 8B D6 48 8B CF E8 2B AD 99 FF"),
@@ -473,10 +479,19 @@ internal static class Program
  ("ctor scene load", 0xD733C2, "48 8B 3D E7 F8 C0 07"),
  // FUN_140d5e2c0 publishes CameraPredictionManager* into the BSS qword.
  ("cam qword store", 0xD5FA19, "48 89 1D 90 32 C2 07"),
- // FUN_1401e6100 and FUN_1402250c0 prologues. The one-shot calls these
- // entries directly; the bytes are the ones the call sites land on.
+ // FUN_1401e6100 prologue. The one-shot calls this entry and no other.
+ // FUN_1402250c0 stays in the table so a rebuild still proves the
+ // push the previous run used; this build does not call it.
  ("alloc FUN_1401e6100", 0x1E6100, "48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58"),
  ("insert FUN_1402250c0", 0x2250C0, "48 89 5C 24 18 48 89 7C 24 20 41 56"),
+ // The two loads the list walkers do on every PlayerGame. Both are
+ // [reg+0xE8] and the next instruction is TEST. A record without the
+ // NetPlayerGame back-pointer takes the null arm. The camera-list
+ // publish inside FUN_140d73270 is the one that is not optional:
+ // LEA RCX,[RDI+0x30]; MOV RDX,R14; CALL FUN_1400fe310.
+ ("walker load +0xE8", 0x916AC8, "49 8B 80 E8 00 00 00"),
+ ("cache load +0xE8", 0x916C43, "48 8B 88 E8 00 00 00"),
+ ("ctor cam-list publish", 0xD733DC, "48 8D 4F 30 4C 0F 44 F5 49 8B D6 E8 24 AF 38 FF"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  // FUN_140d63060 writes the published GameModule's +0x50. The load of
