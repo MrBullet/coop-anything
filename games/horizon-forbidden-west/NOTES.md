@@ -844,9 +844,11 @@ sampler. The loader writes one byte to `hfw_probe.dll.mode` beside the
 DLL (not in the game directory). The DLL reads that byte from its own
 module path and, only when it is 1, starts `spawn_once` instead of the
 sampler. That thread waits until `[pm+0x08] >= 1` (60 s timeout), logs
-`spawn-once before count=N`, calls `FUN_14134c950` once inside
-`__try`, logs `spawn-once after count=N list=...`, and exits. It does
-not store the double3 and does not call `FUN_14101bd70`.
+`spawn-once before count=N storage=...`, calls `FUN_14134c950` once
+inside `__try` with a zeroed unused argument, then logs
+`spawn-once after called=1 code=0x00000000 count=N storage=... delta=...`.
+`storage` is `[pm+0x10]`. It does not store the double3 and does not
+call `FUN_14101bd70`. A count of 1 then 2 is the second body.
 
 A second body is the milestone after a log that shows `count=1` then
 `count=2`. Driving that body's double3 from a received pose is the
