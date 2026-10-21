@@ -1209,17 +1209,130 @@ RBX` at `0x913CB7`). Microsoft x64, two register args, return in
 `FUN_14134c950`. Do not re-enable that function. Do not emit
 `FUN_140d8c2d0`.
 
+### Second allocator: `FUN_1413d8470` (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only. One Ghidra `-noanalysis -readOnly -process` pass per
+script (`local/ghidra_scripts/PlayerGameAlloc.java` and the numbered
+follow-ups, reports `local/playergame_alloc*.txt`). No symbol-table
+scan, no re-analysis, no inject, no launch, nothing written under
+`M:\`. `--spawn-once` was not rebuilt into a call. The function was
+not called.
+
+The call at `0x13D8540` is inside `FUN_1413d8470` (`0x13D8470`, 365
+bytes). It is a `NetPlayerGame` constructor, not a stack temporary:
+
+```
+undefined8 * FUN_1413d8470(undefined8 *param_1)
+```
+
+`RCX` at entry is the `NetPlayerGame` being built. It is saved to
+`RBX` at `0x13D8495` and returned in `RAX` at `0x13D85CF`. The
+`PlayerGame` is a fresh heap block, not a field of that object and
+not a pool slot.
+
+The size is the same static record the blocked function uses, read
+rather than written as an immediate. Bytes at RVA `0x2161590`:
+
+```
+FF FF FF FF 04 00 01 00 00 00 FF 00 01 00 00 00
+10 02 00 00 ...
+```
+
+Tag byte `0x2161594` is `0x04`. Case 4 of the size switch falls
+through, so `EDX` is the dword at `0x21615A0`, which is `10 02 00 00`
+(`0x210`). Then:
+
+```
+RVA 0x13D852B MOVSXD RCX, EDX
+RVA 0x13D852E CALL 0x1401e6100
+RVA 0x13D8533 MOV RDI, RAX
+RVA 0x13D853A MOV RDX, RSI
+RVA 0x13D853D MOV RCX, RDI
+RVA 0x13D8540 CALL 0x140d73270
+```
+
+`RSI` is `[[0x148983150]+0x50]+0x20`, loaded at `0x13D847F` /
+`0x13D84A0` / `0x13D84A4` with no null test. If the size is 0 the
+function zeroes `EDI` at `0x13D8538` and still calls the constructor,
+passing a null `this`. On the live path the size is not 0.
+
+After the constructor it writes three vtables onto `param_1`, in
+order, each confirmed from the COL before the vtable:
+
+| RVA | store | RTTI |
+|---|---|---|
+| `0x13D8554` | `[RBX] = 0x141849A60` | `.?AVNetReplicatedObject@@` |
+| `0x13D8573` | `[RBX] = 0x1418C48F8` | `.?AVNetPlayer@@` |
+| `0x13D85CC` | `[RBX] = 0x141980B30` | `.?AVNetPlayerGame@@` |
+
+It then stores the new `PlayerGame` at `[NetPlayerGame+0x40]`
+(`0x13D8576`) and the `NetPlayerGame` back at `[PlayerGame+0xE8]`
+(`0x13D85BE`).
+
+Globals this function dereferences: `0x148983150` (the `GameModule*`,
+one load, no store), and the static type record
+`0x2161594` / `0x2161596` / `0x2161598` / `0x21615A0` / `0x21615A8` /
+`0x21615D8`, plus the two bytes copied onto the object at
+`0x2012B70` / `0x2012B71`. It does **not** dereference
+`0x1489581F0`. 87 instructions, 17 data targets, one watch hit, and
+that hit is the module global.
+
+References to `FUN_140d73270`, all five of them:
+
+| from | what it is |
+|---|---|
+| `0x134CA90` | `CALL` inside `FUN_14134c950` |
+| `0x134CAA8` | `CALL` inside `FUN_14134c950`, null-`this` arm |
+| `0x13D8540` | `CALL` inside `FUN_1413d8470` |
+| `0xD724ED` | `JMP` thunk at `0xD724E0`: `MOV RCX, RDX; XOR EDX, EDX; JMP FUN_140d73270`. Constructs whatever pointer it was given. Does not allocate. |
+| `0x8C36984` | data, no function |
+
+`FUN_1401e6100` inside `FUN_14134c950` is called twice (`0x134CA82`
+for the `PlayerGame`, `0x134CE47` for a second record). The second
+one reads a different type record, RVA `0x220F054`, whose size dword
+at `0x220F060` is `48 00 00 00` (`0x48`), and the pointer it loads at
+`0x134CDDD` is the thunk `0x13D8450`, not `FUN_140d73270`. So that
+allocation is not a `PlayerGame`.
+
+Who calls `FUN_1413d8470`. No direct `CALL` from another function.
+Two references: the data slot at RVA `0x8C8EC20` (a packed dword
+`01 3D 84 70` inside `.pdata`, the only such dword outside `.text`),
+and the thunk at `0x13D8450`:
+
+```
+RVA 0x13D8450 TEST RDX, RDX
+RVA 0x13D8453 JZ 0x1413d845d
+RVA 0x13D8455 MOV RCX, RDX
+RVA 0x13D8458 JMP 0x1413d8470
+```
+
+That thunk's only reference is a data read at `0x134CDDD`, which is
+inside `FUN_14134c950`. So the only thing that invokes this allocator
+today is the function that is blocked.
+
+Conclusion: a second allocator exists and it does not touch the null
+global. `FUN_1413d8470` at RVA `0x13D8470` calls `FUN_1401e6100` at
+`0x13D852E` with `0x210` from the type record at `0x21615A0`, then
+`FUN_140d73270(block, [[GameModule+0x50]+0x20])`. It runs only as the
+constructor of a `NetPlayerGame`, and the only caller of that
+constructor is `FUN_14134c950` itself, via the thunk at `0x13D8450`.
+Nothing else allocates a `0x210` `PlayerGame`. The thunk at
+`0xD724E0` constructs an already-allocated pointer with a null entity
+and does not allocate. Not called. `--spawn-once` stays blocked.
+
 ## Not tried (next session)
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised: the slot is live and `entity` is non-null
- (see the runtime above). Next is the allocator of a `PlayerGame`
- outside `FUN_14134c950`, then `FUN_140d73270(this, entity)` and the
- insert virtual `FUN_140d8c2d0`. Documented only. Do not call
- `FUN_14134c950`. Do not write the double3. Do not call
- `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
- `FUN_140d8c2d0` until the allocation is named.
+- Milestone 2, revised again: the allocator is named. Next is a
+ one-shot that calls `FUN_1401e6100(0x210)`, then
+ `FUN_140d73270(block, entity)` with the live entity from
+ `--read-slot`, then the insert virtual `FUN_140d8c2d0`. Documented
+ only. Do not call `FUN_14134c950`. Do not call `FUN_1413d8470`
+ (it builds a `NetPlayerGame` and writes `[PlayerGame+0xE8]`). Do
+ not write the double3. Do not call `FUN_14101bd70`. Do not store
+ to `entity+0xD8`. Do not emit `FUN_140d8c2d0` until that one-shot
+ is the thing being tested.
 
 ## Sources
 
