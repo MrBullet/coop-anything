@@ -2582,6 +2582,88 @@ zero store (`48 89 B7 F0 00 00 00` at `0x913C9C`), the link prologue
 (`49 63 45 30` at `0x930FF8`, `49 8B 7D 38` at `0x930FEE`). No inject,
 no launch.
 
+### Slot `+0x18` is the damage dispatcher (2026-10-21)
+
+Offline only. Three `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot18.java`, `Slot18Names.java`,
+`Slot18Col.java`; reports `local/slot18.txt`,
+`local/slot18_names.txt`, `local/slot18_col.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. No call frame is complete, so nothing was emitted.
+
+`FUN_140d5b960` is 1504 bytes and takes three arguments. `RCX` is the
+`EntityManagerGame*` (saved to `R15` at `0xD5B987`, then used as
+`this+0x28` for the critical section). The other two are named by the
+entry and by the RTTI of the object the function builds from them:
+
+```
+RVA 0xD5B960 TEST RDX,RDX
+RVA 0xD5B963 JZ 0x140d5be41 ; return when the entity is null
+RVA 0xD5B96C MOV qword ptr [RAX + 0x18],R8 ; spill the damage params
+RVA 0xD5B999 MOV RDI,R8
+RVA 0xD5B9A0 MOV RSI,RDX
+```
+
+`RDX` is the `Entity*` being damaged. `R8` is a `DamageParams const&`.
+Both names come from the function itself, not from a caller. At
+`0xD5BAE8` it stores the vtable whose Complete Object Locator
+(`0x141A85C68`) names
+`ParameterSet<EventTypeMarshal, Entity*, DamageParams const&, EntityManagerGame*, void (EntityManagerGame::*)(Entity*, DamageParams const&)>`,
+and it fills that record with `RDX+0x20` (`LEA RCX, [RSI+0x20]` at
+`0xD5BAEB`) and a copy of `R8`. Later it builds `MsgModifyDamage`
+(`0xD5BCD4`, COL `0x141A85150`), `MsgModifyDamageDealt`
+(`0xD5BBB6`), `MsgModifyDamageFlags` (`0xD5BC4B`) and, on the network
+arm, `NetMsgDamage` (`0xD5BEED`, COL `0x141A46A58`).
+
+`R8` is the record `FUN_1408f9890` copies. The call at `0xD5B9D4` is
+`FUN_1408f9890(RBP-0x80, R8)`, and the callee (237 bytes) only copies
+fields: two `VMOVUPS` at `0x8F989A` and `0x8F98A2`, then one field at
+a time from `[RDX+0x48]` through `[RDX+0xB1]` into the destination.
+It returns the destination. So `R8` is a `0xB2`-byte damage record,
+not an entity.
+
+The pointer at `0xD5B9EB` is a field of `R8`, and it is a load:
+
+```
+RVA 0xD5B9B6 MOV RAX,qword ptr [RDI + 0x20] ; [DamageParams+0x20]
+RVA 0xD5B9C2 LEA RCX,[RAX + 0x18]
+RVA 0xD5B9C6 CMOVZ RCX,RDX ; 0x38 when that field is null
+RVA 0xD5B9CD MOV R13,qword ptr [RCX] ; the entity pointer inside it
+RVA 0xD5B9DC LEA RAX,[R13 + 0x70]
+RVA 0xD5B9E0 MOV ECX,0x90
+RVA 0xD5B9E5 CMOVZ RAX,RCX
+RVA 0xD5B9EB MOV RDI,qword ptr [RAX + 0x20]
+```
+
+Nothing is written there. When the loaded qword is non-null the next
+instruction subtracts `0x20` (`ADD RDI, -0x20` at `0xD5B9F4`), the
+same entity-from-node adjustment already named for `[parent+0x220]`.
+The result is the other entity in the damage, and it is only read:
+passed to `FUN_1409aa0a0(entity, other)` at `0xD5BA6D`, and used as
+the base of `MsgModifyDamageDealt` at `[RDI+0x70]` (`0xD5BBB2`). The
+`LEA RCX, [R13+0xC8]` at `0xD5BEC0` is the same kind of load, a byte
+compared against `2` at `0xD5BED0`. No list grows.
+
+There is no direct call. The reference manager lists five sites and
+all five are data. One is the vtable slot itself, qword RVA `0xD5B960`
+at `0x18FB578`, which is `EntityManagerGame::vftable + 0x18`. The
+other four (`0x8C35DE0`, `0x1C0F0F4`, `0x1C0F150`, `0x1C0F170`) are
+unwind rows: each qword is `0xD5B960` in the low half and a frame
+offset in the high half, followed by the spill sites `0xD5B983` and
+`0xD5B98A`. No `CALL` instruction targets the entry, so no caller
+shows the argument types. The RTTI above is what names them.
+
+Miss. Neither register is an entity this function inserts. `RDX` is
+an entity the caller already has, and the function only dispatches
+damage onto it. The single next decompile is `FUN_1409aa0a0`, called
+at `0xD5BA6D` as `(RDX, the other entity)`: say whether that function
+links the two entities or only compares them. No call until that is
+named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
