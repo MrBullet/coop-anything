@@ -3,11 +3,13 @@
 Status: **phase 5, ADD-PLAYER BLOCKED** (2026-10-21) — `--add-player`
 does not call `FUN_1401e6100`, `FUN_140d73270`, or the player-list
 insert. `FUN_140d73270` at RVA `0xD733C2` loads `[0x148982CB0]` into
-`RDI` and the next call, `CALL [0x14174B1C8]` at `0xD733D3` with
-`RCX = RDI+0x20`, has no null test. That is a scene pointer the probe
-thread does not own. `--spawn-once` still does not call
-`FUN_14134c950`. `--read-slot` is unchanged. Claim issue:
-cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
+`RDI` and the next call at `0xD733D3` is `AcquireSRWLockExclusive` on
+`RDI+0x20`, with no null test. That qword is its own BSS global, not
+a field of `PlayerManager`. `FUN_140d5e2c0` publishes a
+`CameraPredictionManager*` there at startup and `FUN_140d60010`
+clears it. The live value after a save load was not read. `--spawn-once`
+still does not call `FUN_14134c950`. `--read-slot` is unchanged. Claim
+issue: cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
 
 The BSS qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
@@ -1332,15 +1334,16 @@ and does not allocate. Not called. `--spawn-once` stays blocked.
 - Socket activity observation, single-instance mutex survey for two copies.
 - Map WS2_32 call sites; map the tables that invoke the NetGameDummy factory.
 - Ask JustAddMP/core author about a license (owner approval for contact).
-- Milestone 2, revised again: the allocator is named. Next is a
- one-shot that calls `FUN_1401e6100(0x210)`, then
- `FUN_140d73270(block, entity)` with the live entity from
- `--read-slot`, then the insert virtual `FUN_140d8c2d0`. Documented
- only. Do not call `FUN_14134c950`. Do not call `FUN_1413d8470`
- (it builds a `NetPlayerGame` and writes `[PlayerGame+0xE8]`). Do
- not write the double3. Do not call `FUN_14101bd70`. Do not store
- to `entity+0xD8`. Do not emit `FUN_140d8c2d0` until that one-shot
- is the thing being tested.
+- Milestone 2, revised again: `[0x148982CB0]` is a
+ `CameraPredictionManager*` published by `FUN_140d5e2c0` at
+ `0xD5FA19` and cleared by `FUN_140d60010` at `0xD60547`. Next is a
+ read-only probe of that one qword after a save load. If it is
+ non-null, the constructor's `AcquireSRWLockExclusive(RDI+0x20)` has
+ a lock to take; if it is null, the startup store did not survive.
+ Do not call `FUN_14134c950`. Do not call `FUN_1413d8470`. Do not
+ call `FUN_140d73270` from that probe. Do not write the double3. Do
+ not call `FUN_14101bd70`. Do not store to `entity+0xD8`. Do not emit
+ `FUN_140d8c2d0`.
 
 ### `--add-player` blocked (2026-10-21, Ghidra `-noanalysis`)
 
@@ -1388,13 +1391,13 @@ RVA 0xD733DC LEA RCX, [RDI+0x30]
 RVA 0xD733E7 CALL 0x1400fe310
 ```
 
-`0xD7339C` has a null test. `0xD733C2` does not. `RDI` is a scene
-pointer the probe thread does not own, and both calls after it use
-`RDI+0x20` and `RDI+0x30`. A null there is `0xC0000005` inside the
+`0xD7339C` has a null test. `0xD733C2` does not. Both calls after it
+use `RDI+0x20` and `RDI+0x30`. A null there is `0xC0000005` inside the
 constructor, the same class of fault `--spawn-once` already hit. The
 image bytes at `0x148982D88` are eight zeroes; the live qword is
 whatever the running game stored, and the probe cannot know it before
-the call.
+the call. The "scene pointer" reading of `RDI` is wrong; the writer
+pass below names it.
 
 Insert, the `pm+8` arm of `FUN_140d8c2d0`. The `PlayerGame` is in
 `RBX`, which was `RDX` at entry (`MOV RBX, RDX` at `0xD8C2E4`):
@@ -1431,6 +1434,128 @@ blocking load (`48 8B 3D E7 F8 C0 07` at `0xD733C2`).
 The running game had the previous `hfw_probe.dll` mapped, so the new
 DLL is `hfw_probe_new.dll` beside it and the loader prefers that name
 when the file exists.
+
+### Who writes `[0x148982CB0]` (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only. No inject, no launch, nothing written under `M:\`, no
+re-analysis, no symbol-table scan. A Python scan of `.text` in the
+workspace exe (SHA-256 unchanged, image base `0x140000000`) found every
+RIP-relative `disp32` whose target is VA `0x148982CB0`, then checked
+that no absolute `imm64` of that VA exists anywhere in the file (0
+hits). Ghidra was then opened `-noanalysis -readOnly -process` three
+times (`local/ghidra_scripts/SceneQword.java` and the two follow-ups,
+reports `local/scene_qword.txt`, `local/scene_qword2.txt`,
+`local/scene_qword3.txt`) and asked only about the sites the scan
+named.
+
+The load the constructor uses is the one already quoted, and Ghidra
+prints the same instruction:
+
+```
+RVA 0xD733C2  48 8B 3D E7 F8 C0 07  MOV RDI, qword ptr [0x148982CB0]
+```
+
+`0xD733C2 + 7 + 0x07C0F8E7 = 0x8982CB0`. The next two calls are not
+virtuals of `RDI`. `CALL [0x14174B1C8]` at `0xD733D3` is the IAT slot
+`PTR_AcquireSRWLockExclusive`, and `CALL [0x14174B1C0]` at `0xD733F4`
+is `PTR_ReleaseSRWLockExclusive`. `RCX` for the acquire is
+`LEA RBX, [RDI+0x20]` from `0xD733C9`. `FUN_1400fe310` at `0xD733E7`
+takes `LEA RCX, [RDI+0x30]` and `RDX = R14`, and its first read is
+`MOVSXD RBP, dword ptr [RCX]`.
+
+The qword is its own BSS slot, not a field of the `PlayerManager`.
+`PlayerManagerGame*` is the neighbouring global at RVA `0x8982C80`,
+`0x30` bytes earlier. The same `.text` scan against that slot returns
+303 sites, and the only store among them is `MOV [0x148982C80], RAX`
+at `0xD5E68B` (`48 89 05 EE 45 C2 07`). Nothing in that set is a store
+through a base register plus `0x30`. Both addresses sit past the raw
+size of `.data` (VA `0x1CA1000`, raw `0x626800`), so both are
+zero-filled BSS, not a field of a file-backed object.
+
+Of the 18 RIP-relative sites that name `0x148982CB0`, two store and
+sixteen only load or compare. The stores:
+
+```
+FUN_140d5e2c0  RVA 0xD5FA19  48 89 1D 90 32 C2 07  MOV [0x148982CB0], RBX
+FUN_140d60010  RVA 0xD60547  4C 89 2D 62 27 C2 07  MOV [0x148982CB0], R13
+```
+
+`FUN_140d5e2c0` (`0xD5E2C0`, 6903 bytes) is `GameModule::vftable+0x20`
+(vtable RVA `0x18FB8B0`, `.?AVGameModule@@`, COL `0x1A838A0`). It is
+the same function that publishes `PlayerManagerGame*` at `0xD5E68B`
+and `GameModule*` at `0xD5E768`. `RBX` at the store is the block
+allocated eight instructions earlier:
+
+```
+RVA 0xD5F9F1  48 63 C8              MOVSXD RCX, EAX
+RVA 0xD5F9F4  E8 07 67 48 FF        CALL 0x1401e6100
+RVA 0xD5F9F9  48 8B D8              MOV RBX, RAX
+RVA 0xD5F9FC  33 D2                 XOR EDX, EDX
+RVA 0xD5FA04  48 8B CB              MOV RCX, RBX
+RVA 0xD5FA07  E8 B4 F7 9C 00        CALL 0x14172f1c0        ; memset 0, size 0x250
+RVA 0xD5FA0C  48 8B CB              MOV RCX, RBX
+RVA 0xD5FA0F  E8 AC 87 BF FF        CALL 0x1409581c0
+RVA 0xD5FA14  B9 18 00 00 00        MOV ECX, 0x18
+RVA 0xD5FA19  48 89 1D 90 32 C2 07  MOV [0x148982CB0], RBX
+```
+
+`RBX` is not written between `MOV RBX, RAX` and the store. The size
+comes from the static record at RVA `0x20FAC30`: the file dword there
+is `0xFFFFFFFF` and the next byte is `0x04`, which is the
+`byte == 4` test at `0xD5F9C9`, and `FUN_1402032d0` returns the size
+that `MOVSXD` puts in `RCX`. The memset length is the immediate
+`0x250` at `0xD5FA01`. `FUN_1409581c0` (186 bytes) then writes the
+vtable:
+
+```
+RVA 0x9581CC  LEA RAX, [0x1418AC588]
+RVA 0x9581E2  MOV [RCX], RAX
+RVA 0x9581E5  ADD RCX, 0x20
+RVA 0x9581E9  CALL [0x14174B5F8]     ; InitializeSRWLock(this+0x20)
+RVA 0x9581EF  LEA RCX, [RBX+0x28]
+RVA 0x9581F3  CALL [0x14174B5F8]     ; InitializeSRWLock(this+0x28)
+RVA 0x9581F9  MOV [RBX+0x30], RDI    ; RDI is 0
+```
+
+The COL before `0x1418AC588` is VA `0x141A259B8` (signature `1`), and
+its type descriptor is `.?AVCameraPredictionManager@@`. The second
+pointer, stored at `+0x70` from `LEA RAX, [0x141833F88]`, is
+`.?AVRenderDataCollector@@` (COL `0x1419E4DF8`). So `+0x20` is an
+`SRWLOCK` that this constructor initializes, not a function pointer,
+and `+0x30` is a count-and-pointer record that `FUN_1409581c0` zeroes
+and `FUN_1400fe310` appends to.
+
+`FUN_140d60010` (`0xD60010`, 5873 bytes) is the next slot,
+`GameModule::vftable+0x28`. It loads the qword, zeroes it, then calls
+the virtual destructor:
+
+```
+RVA 0xD60538  48 8B 0D 71 27 C2 07  MOV RCX, [0x148982CB0]
+RVA 0xD6053F  45 33 ED              XOR R13D, R13D
+RVA 0xD60542  48 85 C9              TEST RCX, RCX
+RVA 0xD60545  74 11                 JZ 0x140d60558
+RVA 0xD60547  4C 89 2D 62 27 C2 07  MOV [0x148982CB0], R13
+RVA 0xD60552  48 8B 01              MOV RAX, [RCX]
+RVA 0xD60555  FF 50 08              CALL [RAX+0x8]
+```
+
+`R13` is zero at the store. The same function then clears
+`0x148982FD8` and, further down, reads `SceneManagerGame*` at
+`0x148982DD0`. Both functions have only data references (vtable slots
+`0x18FB8D0` and `0x18FB8D8`), no direct `CALL`.
+
+Decision: **(a)**. The only non-null store is `0xD5FA19`, and it runs
+inside `GameModule::vftable+0x20`, the same startup function that
+publishes `GameModule*` and `PlayerManagerGame*`. The only clear is
+`0xD60547`, inside `GameModule::vftable+0x28`. Nothing else writes the
+qword, so a loaded game still holds the pointer from that startup
+store unless that second virtual has already run. Whether the pointer
+is non-null after a save load was not read from a process this
+session; the static evidence says the startup store fills it and only
+the shutdown virtual clears it.
+
+The constructor is still not called. A future probe only reads
+`[0x148982CB0]` after a save load and skips the call while it is null.
 
 ## Sources
 
