@@ -2998,6 +2998,129 @@ given into a manager we already hold, or only forwards the
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140aa4180` forwards a job onto a `SceneComponent`, it does not insert an entity (2026-10-22)
+
+Offline only. Four `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Aa4180.java`, `Aa4180b.java`, `Aa4180c.java`,
+`Aa4180d.java`; reports `local/aa4180.txt`, `local/aa4180b.txt`,
+`local/aa4180c.txt`, `local/aa4180d.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. The function does not insert, so no call frame was
+emitted.
+
+`FUN_140aa4180` is 292 bytes and returns void. It takes two
+arguments. There is no `R8`. Both are saved at the entry, and only
+`RDX` is written back, into a field of `RCX`:
+
+```
+RVA 0xAA418F MOV RBX,qword ptr [RCX + 0x48]
+RVA 0xAA4193 MOV RSI,RDX
+RVA 0xAA4196 MOV qword ptr [RCX + 0x50],RDX
+RVA 0xAA419A MOV RDI,RCX
+```
+
+`RCX` is the return of `FUN_14095fcb0`. That function is 101 bytes.
+It does not return the entity and it does not return a manager. It
+looks a component up in the entity's component map and returns that
+component:
+
+```
+RVA 0x95FCB6 MOV RDI,RCX
+RVA 0x95FCB9 LEA RDX,[0x142121a20]
+RVA 0x95FCC0 ADD RCX,0xa0
+RVA 0x95FCC7 CALL 0x1408fa230
+```
+
+`FUN_1408fa230` binary-searches the map at `entity+0xa0` for the
+type id and returns the matching pointer. The id at RVA `0x2121A20`
+has the same header shape as `ControlledEntity` (`tag +4` is
+`0x04`, size dword at `+0x10` is `0x70`). Its name qword at `+0x40`
+reads `SceneComponent`. So `RCX` of `FUN_140aa4180` is a
+`SceneComponent*` already attached to the entity. If the lookup
+misses, `FUN_14095fcb0` builds one (`FUN_1408f9ff0` on the same
+record) and `FUN_140950d10` attaches it to the entity, then returns
+that new component. Either way the return is the component, not the
+entity and not one of the managers we hold.
+
+`RDX` is the job `FUN_140a9f910` already had in `RDI` (`MOV RDX,RDI`
+at `0xA9F94E`). The only pointer store in the 292 bytes is the one
+above: the job is written to `SceneComponent+0x50`. The other stores
+are the saved registers and a stack message. Nothing writes
+`child+0x80`, `parent+0x88`, a counted world or scene array, or a
+model slot.
+
+What it does instead. It walks children the component's entity
+already has, and forwards the same job:
+
+```
+RVA 0xAA419D MOV RBX,qword ptr [RBX + 0x88] ; entity+0x88, the child list
+RVA 0xAA41E6 MOV RBX,qword ptr [RBX + 0x90] ; next sibling
+RVA 0xAA41BD LEA RCX,[RBX + 0xa0]
+RVA 0xAA41C4 LEA RDX,[0x142121a20] ; SceneComponent again
+RVA 0xAA41CB CALL 0x1408fa230
+RVA 0xAA41E1 CALL 0x140aa4180 ; recurse, RDX still the job
+```
+
+Then it dispatches messages the component already owns.
+`FUN_140aa4e20` builds a `MsgSceneRestrictionChanged` (type record
+RVA `0x2121CE0`, name at `+0x40`) whose payload qword is the job,
+and `FUN_14097fbe0` walks the listeners already registered on
+`entity+0x2c0`. When `SceneComponent+0x38` is non-zero,
+`FUN_140aa4790` filters the job's message list for `MsgScene`
+(record RVA `0x2121E40`, the same record `FUN_140a9b780` compared
+against) and `FUN_14097fec0` only bumps a listener dword. The stack
+object built at `0xAA4214` is a `MsgAddedToScene` (vftable RVA
+`0x18C6AA0` points at type record `0x2122940`, name `MsgAddedToScene`,
+size `0x18`), and it is passed to the same listener walk
+(`FUN_14097fbe0` at `0xAA428F`). `FUN_14097fbe0` calls registered
+handlers. It does not append an entity.
+
+The four globals we hold are not referenced. `FUN_140aa4180`,
+`FUN_14095fcb0`, `FUN_140aa4e20` and `FUN_140aa4790` contain no load
+of `EntityManagerGame*` (`0x8982C40`), `GameModule*` (`0x8983150`),
+`SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*` (`0x8982C80`).
+An allocated `ControlledEntity` has no `SceneComponent` at `+0xa0`
+and no listener table at `+0x2c0`, so it does not fill `RCX` either.
+
+Miss. `FUN_140aa4180` does not insert the entity into a manager. It
+forwards the job to a `SceneComponent` the entity already carries,
+and that component posts `MsgAddedToScene` to listeners the entity
+already has. No call frame.
+
+The call is also gated. `FUN_140a9f910` only reaches it when
+`[message+0x60] == 1` (`CMP dword ptr [RDX+0x60], 0x1` /
+`JNZ 0xA9F959` at `0xA9F940`). After it returns, the same function
+walks a pointer array the job already owns and virtual-calls slot 0
+with the recovered entity:
+
+```
+RVA 0xA9F959 MOV RBX,qword ptr [RDI + 0x2f0]
+RVA 0xA9F960 MOVSXD RAX,dword ptr [RDI + 0x2e8]
+RVA 0xA9F967 LEA RSI,[RBX + RAX*0x8]
+RVA 0xA9F970 MOV RCX,qword ptr [RBX]
+RVA 0xA9F973 MOV RDX,RBP
+RVA 0xA9F97E MOV RAX,qword ptr [RCX]
+RVA 0xA9F981 CALL qword ptr [RAX]
+```
+
+`RCX` is an element of `job+0x2f0` (count at `job+0x2e8`, stride 8).
+`RDX` is the entity recovered by `LEA RBP,[RAX-0x20]` at `0xA9F938`.
+`R8B` is 1 when `[message+0x60]` is 0. That is the first call in
+this chain whose arguments are the entity and a live object the job
+already points at.
+
+The single next decompile is whatever function the vtable at
+`[job+0x2f0]` slot 0 actually is. The question is whether that
+virtual call inserts the entity in `RDX` into a manager we already
+hold. Read one live element of `job+0x2f0` (the job object is the
+`RCX` of `FUN_140a9f910`, which is the `RBP` the drain at `0xA9B54A`
+passes) and decompile only that slot-0 target. No call until that
+target is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
