@@ -21,6 +21,13 @@
  * plus50 is [module+0x50]. entity is [[module+0x50]+0x20] when plus50
  * is non-null, else 0. No game function is called. Nothing is written.
  *
+ * --add-player (opt-in, mode byte 3): does NOT call FUN_1401e6100,
+ * FUN_140d73270, or FUN_1402250c0. The constructor is unsafe from this
+ * thread: at RVA 0xD733C2 it does MOV RDI,[0x148982CB0] and at 0xD733D3
+ * CALL [0x14174B1C8] with RCX = RDI+0x20 and no null test. The insert
+ * arm also calls PlayerGame vtable +0x60/+0x68 before the pm+8 push.
+ * This mode logs the block and exits. It does not write entity+0xD8.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -76,6 +83,10 @@
  * RVA 0x134C9BA: MOV RCX, [RAX+0xF8] where RAX came from
  * MOV RAX, [0x1489581F0] at 0x134C9B1. RVA of that global: */
 #define RVA_SPAWN_CTX 0x89581F0ull
+
+/* FUN_140d73270 at RVA 0xD733C2: MOV RDI, [0x148982CB0], then
+ * LEA RBX,[RDI+0x20] / CALL [0x14174B1C8] with no TEST RDI. */
+#define RVA_CTOR_SCENE 0x8982CB0ull
 
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
@@ -139,7 +150,32 @@ static DWORD WINAPI spawn_once(LPVOID unused)
  return 0;
 }
 
-/* 0 = default sampler, 1 = spawn-once (blocked), 2 = read-slot. */
+/* Do not call FUN_1401e6100, FUN_140d73270, or the pm+8 insert.
+ * The constructor's first unchecked deref is the scene global. */
+static DWORD WINAPI add_player(LPVOID unused)
+{
+ FILE *fp;
+ unsigned long long scene = 0;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IOFBF, 8192);
+ scene = rd64(exe_base() + RVA_CTOR_SCENE);
+ fprintf(fp,
+ "add-player blocked: FUN_140d73270 derefs [0x148982CB0] "
+ "(MOV RDI,[0x148982CB0] at RVA 0xD733C2, then LEA RBX,[RDI+0x20] "
+ "at 0xD733C9 and CALL [0x14174B1C8] at 0xD733D3 with no null test). "
+ "live qword=0x%llX. alloc FUN_1401e6100 (RCX=size, site 0x13D852E) "
+ "and insert FUN_1402250c0 (RDX=&PlayerGame in RBX, site 0xD8C393) "
+ "not called. count stays.\n",
+ scene);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+}
+
 static int mode_byte(HINSTANCE inst)
 {
  wchar_t path[MAX_PATH];
@@ -310,6 +346,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  DisableThreadLibraryCalls(inst);
  if (mode == 1) entry = spawn_once;
  else if (mode == 2) entry = read_slot;
+ else if (mode == 3) entry = add_player;
  thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {

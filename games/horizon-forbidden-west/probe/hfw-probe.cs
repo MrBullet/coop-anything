@@ -21,6 +21,13 @@
 // A line with plus50 non-null is the slot being live. --spawn-once
 // stays the blocked log.
 //
+// --add-player: opt-in. Mode byte 3. The DLL does not call
+// FUN_1401e6100, FUN_140d73270, or the insert. FUN_140d73270 at
+// RVA 0xD733C2 loads [0x148982CB0] into RDI and the next call
+// (0xD733D3) uses RDI+0x20 with no null test. The flag still
+// injects, but the thread only logs "add-player blocked" and exits.
+// Do not expect count=2. --spawn-once and --read-slot are unchanged.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -107,11 +114,14 @@ internal static class Program
 
  var spawnOnce = HasFlag(args, "--spawn-once");
  var readSlot = HasFlag(args, "--read-slot");
+ var addPlayer = HasFlag(args, "--add-player");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
  Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
- if (spawnOnce && readSlot)
+ Note(addPlayer ? "add-player flag seen" : "add-player flag absent");
+ var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0);
+ if (modes > 1)
  {
- Note("REFUSED: --spawn-once and --read-slot are mutually exclusive.");
+ Note("REFUSED: --spawn-once, --read-slot and --add-player are mutually exclusive.");
  return 2;
  }
 
@@ -137,6 +147,12 @@ internal static class Program
  Note($"process found pid={proc.Id}");
 
  var dll = Arg(args, "--dll") ?? Path.Combine(AppContext.BaseDirectory, "hfw_probe.dll");
+ // A live game keeps the previous hfw_probe.dll mapped, so a rebuild
+ // cannot overwrite it. The build drops the new DLL beside it under
+ // this name; prefer it. Once the game is closed, the next build
+ // replaces hfw_probe.dll and this file is gone.
+ var newer = Path.Combine(AppContext.BaseDirectory, "hfw_probe_new.dll");
+ if (Arg(args, "--dll") is null && File.Exists(newer)) dll = newer;
  if (!File.Exists(dll))
  {
  Note($"REFUSED: probe dll not found: {dll}");
@@ -150,7 +166,7 @@ internal static class Program
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
  // 2 read-slot.
- var mode = spawnOnce ? 1 : (readSlot ? 2 : 0);
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : 0));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
@@ -158,7 +174,10 @@ internal static class Program
  Note("REFUSED: inject failed: " + whyNot);
  return 4;
  }
- Note(mode == 1 ? "injected mode=spawn-once" : mode == 2 ? "injected mode=read-slot" : "injected mode=sample");
+ Note(mode == 1 ? "injected mode=spawn-once"
+ : mode == 2 ? "injected mode=read-slot"
+ : mode == 3 ? "injected mode=add-player"
+ : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
  // ASFW_ANY lets the game call SetForegroundWindow and take focus back.
@@ -176,6 +195,15 @@ internal static class Program
  "no game call, no write. log is hfw-probe.log in the game's working directory. " +
  "a live slot is a line 'slot module=0x.. plus50=0x.. entity=0x..' with plus50 not 0. " +
  "samples 20s at 2 Hz after GameModule@0x8983150 is non-null.");
+ return 0;
+ }
+ if (addPlayer)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=add-player. " +
+ "FUN_140d73270 is not called (deref [0x148982CB0] at RVA 0xD733C2 has no null test). " +
+ "FUN_1401e6100 and the insert are not called either. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ "expect a line starting with 'add-player blocked'. do not expect count=2.");
  return 0;
  }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
@@ -405,6 +433,14 @@ internal static class Program
  ("spawn ctx deref +0xF8", 0x134C9BA, "48 8B 88 F8 00 00 00"),
  // size dword the spawn function passes to FUN_1401e6100 (0x210).
  ("spawn alloc size", 0x21615A0, "10 02 00 00"),
+ // FUN_1401e6100 at the NetPlayerGame site. RCX is the size
+ // (MOVSXD RCX,EDX), not a type-record pointer. --add-player does
+ // not call it: the constructor that would consume the block is blocked.
+ ("alloc call site", 0x13D852B, "48 63 CA E8 CD DB E0 FE"),
+ // FUN_140d73270(RDI, RSI) immediately after that alloc.
+ ("ctor call site", 0x13D853A, "48 8B D6 48 8B CF E8 2B AD 99 FF"),
+ // The unchecked deref that blocks the constructor from a foreign thread.
+ ("ctor scene load", 0xD733C2, "48 8B 3D E7 F8 C0 07"),
  ("GetWorldTransform fn", 0x962640, "48 89 74 24 10 57 48 83 EC 60"),
  ("Mat34 load", 0x962697, "C5 FC 10 87 F0 00 00 00"),
  // FUN_140d63060 writes the published GameModule's +0x50. The load of

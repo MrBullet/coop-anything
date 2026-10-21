@@ -1,7 +1,15 @@
 # Horizon Forbidden West (2024 PC, Decima / Nixxes port) — co-op notes
 
-Status: **phase 5, SLOT LIVE, spawn call stays blocked** (2026-10-21) — `--read-slot` after a loaded save saw `GameModule+0x50` non-null for all 40 samples, and `[that+0x20]` non-null too. The BSS
-qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
+Status: **phase 5, ADD-PLAYER BLOCKED** (2026-10-21) — `--add-player`
+does not call `FUN_1401e6100`, `FUN_140d73270`, or the player-list
+insert. `FUN_140d73270` at RVA `0xD733C2` loads `[0x148982CB0]` into
+`RDI` and the next call, `CALL [0x14174B1C8]` at `0xD733D3` with
+`RCX = RDI+0x20`, has no null test. That is a scene pointer the probe
+thread does not own. `--spawn-once` still does not call
+`FUN_14134c950`. `--read-slot` is unchanged. Claim issue:
+cranebeaker/coop-anything#83. See [DECISION.md](DECISION.md).
+
+The BSS qword at `0x1489581F0` has one writer, `MOV [0x1489581F0], RDI` at
 RVA `0xD304B9` in `FUN_140d2fca0`, confirmed from the exe bytes. It
 stores a `NetErrorHandlerGame*` built at startup, and `+0xF8` on that
 object is a `StateInGame*` whose `+0x108` is zeroed in the same
@@ -1333,6 +1341,96 @@ and does not allocate. Not called. `--spawn-once` stays blocked.
  not write the double3. Do not call `FUN_14101bd70`. Do not store
  to `entity+0xD8`. Do not emit `FUN_140d8c2d0` until that one-shot
  is the thing being tested.
+
+### `--add-player` blocked (2026-10-21, Ghidra `-noanalysis`)
+
+Offline only. One Ghidra `-noanalysis -readOnly -process` pass
+(`local/ghidra_scripts/AddPlayerFrames.java`,
+`local/ghidra_scripts/AddPlayerHazard.java`, reports
+`local/addplayer_frames.txt` and `local/addplayer_hazard.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`.
+
+The call frames, written down before the probe was touched:
+
+Alloc, `FUN_1401e6100` at RVA `0x13D852E`, inside `FUN_1413d8470`:
+
+```
+RVA 0x13D8527 TEST EDX, EDX
+RVA 0x13D8529 JZ 0x1413d8538
+RVA 0x13D852B MOVSXD RCX, EDX
+RVA 0x13D852E CALL 0x1401e6100
+RVA 0x13D8533 MOV RDI, RAX
+```
+
+`RCX` is the size, sign-extended from `EDX`. `EDX` is the dword at
+RVA `0x21615A0` (`10 02 00 00`, `0x210`) on the case-4 path. There is
+no second argument and no flags argument. `RDX` is dead at the call.
+The body (`0x1E6100`, 22 instructions) is `MOV RAX, GS:[0x58]`, then
+`[tls+0x1858]` with a fallback call to `__dyn_tls_on_demand_init`
+(`0x165833C`), then `[tls+0x1A10]` with a fallback store of
+`[0x14897A388]`, then `JMP [allocator+0x88](allocator, size)`. It does
+not read `0x1489581F0` and it takes no lock. On its own it would be
+callable from the probe thread.
+
+Constructor, `FUN_140d73270(RCX=block, RDX=entity)`, not called. It
+fills the `0x210` block, then:
+
+```
+RVA 0xD7339C MOV RCX, [0x148982D88]
+RVA 0xD733A3 TEST RCX, RCX
+RVA 0xD733A6 JZ 0x140d733c2
+RVA 0xD733B3 CALL [RAX+0x10]
+RVA 0xD733C2 MOV RDI, [0x148982CB0]
+RVA 0xD733C9 LEA RBX, [RDI+0x20]
+RVA 0xD733D3 CALL [0x14174B1C8]
+RVA 0xD733DC LEA RCX, [RDI+0x30]
+RVA 0xD733E7 CALL 0x1400fe310
+```
+
+`0xD7339C` has a null test. `0xD733C2` does not. `RDI` is a scene
+pointer the probe thread does not own, and both calls after it use
+`RDI+0x20` and `RDI+0x30`. A null there is `0xC0000005` inside the
+constructor, the same class of fault `--spawn-once` already hit. The
+image bytes at `0x148982D88` are eight zeroes; the live qword is
+whatever the running game stored, and the probe cannot know it before
+the call.
+
+Insert, the `pm+8` arm of `FUN_140d8c2d0`. The `PlayerGame` is in
+`RBX`, which was `RDX` at entry (`MOV RBX, RDX` at `0xD8C2E4`):
+
+```
+RVA 0xD8C381 LEA RCX, [RSI+8]
+RVA 0xD8C385 MOV [RSP+0x78], RBX
+RVA 0xD8C38A LOCK INC [RBX+0x18]
+RVA 0xD8C38E LEA RDX, [RSP+0x78]
+RVA 0xD8C393 CALL 0x1402250c0
+```
+
+`FUN_1402250c0(RCX=pm+8, RDX=&slot)` copies `[RDX]` into the list and
+stores the new count with `MOV [RBX], ECX` at `0x22515A`. Reaching
+that arm is not free: `0xD8C313` and `0xD8C33D` call
+`[PlayerGame+0x68]` and `[PlayerGame+0x60]` first, and the false/false
+path is the only one that takes `pm+8`.
+
+Decision: the constructor is not safe to call from the probe thread,
+so none of the three calls is emitted. Calling the allocator alone
+would leak a `0x210` block the constructor never takes, and the insert
+needs a constructed `PlayerGame`. `--add-player` injects and logs:
+
+```
+add-player blocked: FUN_140d73270 derefs [0x148982CB0] ... not called. count stays.
+```
+
+Do not expect `count=2`. `--spawn-once` and `--read-slot` are
+unchanged. Selftest is 26/26 on the offline exe, including the alloc
+call site (`48 63 CA E8 CD DB E0 FE` at `0x13D852B`), the constructor
+call site (`48 8B D6 48 8B CF E8 2B AD 99 FF` at `0x13D853A`) and the
+blocking load (`48 8B 3D E7 F8 C0 07` at `0xD733C2`).
+
+The running game had the previous `hfw_probe.dll` mapped, so the new
+DLL is `hfw_probe_new.dll` beside it and the loader prefers that name
+when the file exists.
 
 ## Sources
 
