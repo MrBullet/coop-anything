@@ -2108,6 +2108,116 @@ Start-Process .\hfw-probe.exe -ArgumentList '--exe','<game dir>\HorizonForbidden
 The line to look for is `link-puppet stop player=0x` with a non-zero
 `entity=0x`, `size=0x300` and `seh=0x00000000`.
 
+### `--link-puppet` live, no crash (2026-10-21)
+
+The owner ran it. The game stayed playable. Copied from the owner's
+log:
+
+```
+link-puppet start one-shot gate=GameModule@0x8983150 cam=0x8982CB0 steps=ctor-from-record,size-from-record,alloc,place,alloc-player,link record=0x21DA6C0 factory-not-called owner-not-passed
+link-puppet gate module=0x1E1FC772300 cam=0x1E6D6973200 waited_s=0 faults=0
+link-puppet stop player=0x1E7CBF33200 entity=0x1E7BB2E1800 vtable=0x7FF62AFF8958 size=0x300 ctor=0x7FF62A840980 seh=0x00000000 (owner not passed, FUN_1402250c0 not called)
+```
+
+`ctor=0x7FF62A840980` is `FUN_1411a0980` (RVA `0x11A0980`), so this
+process's image base is `0x7FF62A840980 - 0x11A0980 = 0x7FF6296A0000`,
+the same rebase as the `--alloc-entity` run. The vtable
+`0x7FF62AFF8958 - 0x7FF6296A0000 = 0x1958958` is
+`ControlledEntity::vftable`. `player=0x1E7CBF33200` is the new
+`PlayerGame`; `entity=0x1E7BB2E1800` is the new `ControlledEntity`,
+not the owner's. `seh=0x00000000`. Publishing this fresh entity onto
+the camera list (the `LEA`/`CALL` at `0xD733E7` inside
+`FUN_140d73270`) did not crash the game. The earlier crash was the
+owner's entity specifically.
+
+`FUN_1402250c0` was not called, so the `PlayerManager` list did not
+grow. No visible body was expected and none appeared. The owner's
+character staying put, with no second body on screen, is the result
+this build was supposed to produce. Nothing to run.
+
+### The registration step, and the parent it still needs
+
+Offline only. Two `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegFifth.java`,
+`local/ghidra_scripts/RegField.java`, `BaseRow.java`; reports
+`local/reg_fifth.txt`, `local/reg_field.txt`, `local/base_row.txt`).
+No re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode: the call below is not complete.
+
+The fifth call is not a fixed function. At RVA `0x1F85FC`:
+
+```
+RVA 0x1F85F1 MOVSX RCX, word ptr [RBP-0x68]
+RVA 0x1F85F6 MOV RDX, RSI ; the new ControlledEntity
+RVA 0x1F85F9 ADD RCX, R14 ; R14 = previous stack entry of the parent
+RVA 0x1F85FC CALL qword ptr [RBP-0x58]
+```
+
+`[RBP-0x58]` is written by the second `FUN_1401feb90` call, at
+`0x1F858E`. That function walks the type record's property rows
+(`[record+0x60]`, count at `[record+7]`, 0x38 bytes each) and, on a
+name match, copies the row into the out-struct. The qword it copies
+to offset `+0x20` of that struct is the function pointer, and the
+word at `+0x8` is the field offset added to `R14`.
+
+`ControlledEntity`'s own record (RVA `0x21DA6C0`) has no rows:
+`[record+7]` is 0 and `[record+0x60]` is null. Its one base, at
+`[record+0x58]` (VA `0x1421D9410`, type VA `0x1420FA8C0`, offset 0),
+has twelve. The row whose function pointer is non-null and whose
+name is the registration is `Parent`:
+
+```
+row +0x10 "Parent"
+row +0x8 0x70000 ; field offset 0
+row +0x18 0x140956290
+row +0x20 0x140956240 ; the pointer copied to [RBP-0x58]
+```
+
+`0x140956240` is eight bytes and not a function of its own:
+
+```
+RVA 0x956240 MOV RDX, [RDX]
+RVA 0x956243 XOR R8D, R8D
+RVA 0x956246 JMP 0x14094afe0
+```
+
+So the call the factory makes is `FUN_14094afe0(RCX = R14 + 0,
+RDX = [newEntity], R8 = 0)`. `R14` is the stack entry the factory
+loaded at entry from the parent:
+
+```
+RVA 0x1F82EA MOV R14, [[RCX+0x58] + [RCX+0x50]*0x20 - 0x20]
+```
+
+The missing field is that one: the qword at
+`[[parent+0x58] + [parent+0x50]*0x20 - 0x20]`, i.e. parent field
+`+0x58` indexed by the count at parent `+0x50`. The parent itself is
+still unnamed. `FUN_1401f7bd0` builds it as `LEA RBX, [RDI-0x20]`
+before the call at `0x1F804E`, and `RDI` there is the caller's own
+frame. No probe mode until that container is a named live object.
+
+`FUN_1401f96d0` (`0x1F96D0`) is not this step. It appends one 0x20-byte
+record — object pointer, type pointer, a refcounted string, a flag —
+to the vector at `[parent+0x50]` (count), `[parent+0x54]` (capacity),
+`[parent+0x58]` (storage). That is the factory's bookkeeping, the
+same vector the fifth call reads back. It does not point the scene
+at the entity.
+
+What else has to point at the entity before a model appears: not the
+vtable. Slot 0 of `ControlledEntity::vftable` is `FUN_141186f10`
+(`0x1186F10`, 8 bytes), and it only returns `&DAT_1421da6c0`, the type
+record. Its three references are the vtable itself, a second vtable,
+and one call inside `FUN_1411a692c`. It loads nothing and is not
+reached from the fifth call. The `Model` row of the same base record
+(row 7, field offset `0xC8`) has both function pointers zero, so the
+factory's fifth call never invokes a model spawn either. The model
+pointer is data at `entity+0xC8`; nothing in this chain writes it.
+
+No mode ships. `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and
+`FUN_14101bd70` stay uncalled, and `entity+0xD8` stays unwritten.
+`--add-player` stays alloc-only. The next run happens only after the
+parent container is named.
+
 Selftest is 46/46 on the offline exe. The six new anchors are the
 walker's call (`FF 50 08` at `0x931073`), the count load and its
 `JS` (`8B 93 F0 00 00 00 83 EA 01 78` at `0x91510A`), the constructor's
