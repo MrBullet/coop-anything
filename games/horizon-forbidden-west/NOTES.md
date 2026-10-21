@@ -2664,6 +2664,123 @@ named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_1409aa0a0` only compares two entities (2026-10-21)
+
+Offline only. Three `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/LinkOrCmp.java`, `Ad6140.java`,
+`SceneXrefs.java`; reports `local/linkorcmp.txt`, `local/ad6140.txt`,
+`local/scene_xrefs.txt`). No re-analysis, no symbol scan, no inject,
+no launch, nothing written under `M:\`. No new probe mode. No call
+frame is complete, so nothing was emitted.
+
+`FUN_1409aa0a0` is 291 bytes and returns a byte. The call at
+`0xD5BA6D` is `(RCX = RSI, RDX = RDI)`, the entity being damaged and
+the other entity from the previous section. Inside, those two
+registers are saved and then only read:
+
+```
+RVA 0x9AA0AA MOV RDI,RCX ; the first entity
+RVA 0x9AA0AD MOV RBX,RDX ; the second entity
+```
+
+The first calls are the shared lock at `0x148956828`
+(`TryAcquireSRWLockShared` at `0x9AA0B7`, `AcquireSRWLockShared` at
+`0x9AA0C8`, `ReleaseSRWLockShared` at `0x9AA1AF`). The first field
+use of either argument is the node array already named on a parent:
+
+```
+RVA 0x9AA0CE MOV RAX,qword ptr [0x148982c40] ; EntityManagerGame*
+RVA 0x9AA0D5 CMP byte ptr [RAX + 0xb1],0x0
+RVA 0x9AA0DC JNZ 0x1409aa17c
+RVA 0x9AA0E2 CMP byte ptr [RAX + 0xb2],0x0
+RVA 0x9AA0E9 JNZ 0x1409aa17c
+RVA 0x9AA0EF MOV RCX,qword ptr [RDI + 0x240] ; data
+RVA 0x9AA0F9 MOVSXD RAX,dword ptr [RDI + 0x238] ; count
+RVA 0x9AA100 IMUL R8,RAX,0x38
+```
+
+`RCX` is the first entity. `RDX` is the second entity. The global is
+only those two flag bytes; `GameModule*`, `SceneManagerGame*` and
+`PlayerManager*` are not loaded.
+
+It does not link them. No instruction writes `child+0x80`,
+`parent+0x88`, or a new node. The walk compares each existing node
+with the other entity and steps by `0x38`:
+
+```
+RVA 0x9AA110 MOV RDX,qword ptr [RCX] ; node+0, entity+0x20
+RVA 0x9AA113 TEST RDX,RDX
+RVA 0x9AA116 LEA RAX,[RDX + -0x20]
+RVA 0x9AA11A CMOVZ RAX,R9
+RVA 0x9AA11E CMP RAX,RBX ; the second entity
+RVA 0x9AA121 JNZ 0x1409aa12e
+RVA 0x9AA128 CMP dword ptr [RCX + 0x34],R9D
+RVA 0x9AA12C JZ 0x1409aa1a6 ; hit: return 1
+RVA 0x9AA12E ADD RCX,0x38
+```
+
+A miss walks the second entity's array the same way (`CMP RAX, RDI`
+at `0x9AA15F`) and returns 0 (`XOR BL, BL` at `0x9AA178`). The other
+arm, taken when `[EntityManagerGame+0xB1]` or `+0xB2` is set, calls
+`FUN_140ad6140` (90 bytes) on `[entity+0x220]` and does not store
+either:
+
+```
+RVA 0x9AA17C LEA RCX,[RDI + 0x220]
+RVA 0x9AA183 MOV RDX,RBX
+RVA 0x9AA186 CALL 0x140ad6140
+```
+
+`FUN_140ad6140` is the same compare through the header the caller
+passes (`[container+0x20]` data, `[container+0x18]` count, stride
+`0x38`). Its only write is the return byte: `XOR AL, AL` at
+`0xAD6194`, or `MOV AL, 0x1` at `0xAD6197` when `CMP RDX, R10` at
+`0xAD6174` hits and the node's dword at `+0x34` is 0 or the sentinel
+at `0x141E89268`. `FUN_1409aa0a0` returns that byte with
+`MOVZX EAX, BL` at `0x9AA1B5`. The damage callback tests it and
+branches (`TEST AL, AL` / `JNZ 0x140d5bba6` at `0xD5BA72`); it does
+not receive a pointer.
+
+Thirty call sites in twenty-seven functions, plus one data xref at
+`0x8BFF928`. Every call passes two pointers and tests `AL`. Besides
+the damage site, the ones that show the relation pass the parent
+already stored at `+0x80`, which this function only reads:
+
+| call | function | what it passes |
+|---|---|---|
+| `0xA7C875` | `FUN_140a7c840` | `(entity, [entity+0x80])` |
+| `0xAD8C3A`, `0xAD8C52` | `FUN_140ad8b90` | `(RDI, RBX)`, then `([RDI+0x80], RBX)` |
+| `0xAD8CF1`, `0xAD8D09` | `FUN_140ad8c90` | `(RDI, [player+0x48])`, then `([RDI+0x80], same)` |
+| `0x161D125`, `0x161D13D` | `FUN_14161d0a0` | the same parent walk |
+
+The other twenty-three pass a pointer and a second pointer adjusted by
+`-0x20` (the node-to-entity step), or the pair saved at
+`[this+0x48]` and `[this+0x58]`. None of them is given a manager
+global.
+
+Miss. The compare never puts an entity anywhere. The single next
+decompile is `FUN_140a8b1d0` (86 bytes). It loads `SceneManagerGame*`
+from `0x148982DD0` and passes its second argument to the append
+already named, `FUN_1400fe310`:
+
+```
+RVA 0xA8B1DF MOV RDI,qword ptr [0x148982dd0]
+RVA 0xA8B1E6 MOV RSI,RDX
+RVA 0xA8B1E9 LEA RBX,[RDI + 0x1c0]
+RVA 0xA8B1F3 CALL qword ptr [0x14174b1c8] ; AcquireSRWLockExclusive
+RVA 0xA8B1F9 LEA RCX,[RDI + 0x1b0]
+RVA 0xA8B200 MOV RDX,RSI
+RVA 0xA8B203 CALL 0x1400fe310
+```
+
+The question is whether `RDX` is an `Entity*`, and whether the counted
+array at `SceneManagerGame+0x1b0` is the scene's entity list. No call
+until that register is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
