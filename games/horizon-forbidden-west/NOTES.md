@@ -3121,6 +3121,112 @@ target is named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### The slot-0 call at `0xA9F981` has no named target (2026-10-22)
+
+Offline only. Read-only `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0.java` through `Slot2f0t.java`;
+reports `local/slot2f0.txt` through `local/slot2f0t.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. The element type was not named, so
+no call frame was emitted.
+
+The call site matches the earlier dump. `FUN_140a9f910` is 752
+bytes. After the `SceneComponent` forward it walks a pointer array:
+
+```
+RVA 0xA9F959 MOV RBX,qword ptr [RDI + 0x2f0]
+RVA 0xA9F960 MOVSXD RAX,dword ptr [RDI + 0x2e8]
+RVA 0xA9F967 LEA RSI,[RBX + RAX*0x8]
+RVA 0xA9F970 MOV RCX,qword ptr [RBX]
+RVA 0xA9F973 MOV RDX,RBP
+RVA 0xA9F97A SETZ R8B
+RVA 0xA9F97E MOV RAX,qword ptr [RCX]
+RVA 0xA9F981 CALL qword ptr [RAX]
+```
+
+`RCX` is one element. `RDX` is the entity from `LEA RBP,[RAX-0x20]`
+at `0xA9F938`. Slot 0 of that element is still not a named function.
+The drain at `0xA9B54A` does not reach it: that instruction is
+`CALL 0x140a9b780`.
+
+Who writes the two fields. `FUN_140a99f10` (1033 bytes) is the
+`Scene` constructor. RTTI on the vtable it installs at `0xA99F60`
+(`0x18C6CF8`) reads `.?AVScene@@`. Its entry is `XOR R8D,R8D`, and
+the two stores are that zero:
+
+```
+RVA 0xA9A1FE MOV qword ptr [RCX + 0x2e8],R8
+RVA 0xA9A205 MOV qword ptr [RCX + 0x2f0],R8
+```
+
+It publishes an empty array. It does not push a listener.
+
+The append primitive for this shape is `FUN_1400fe310` (133 bytes).
+It increments the dword count and stores its second argument at
+`data[oldCount]`. Two callers pass a field at `+0x2e8`:
+
+```
+RVA 0x1405F11 ADD RCX,0x2e8
+RVA 0x1405F18 CALL 0x1400fe310
+```
+
+`FUN_141405ec0` builds the object it appends with vtable RVA
+`0x1990B10`, RTTI `.?AVQuestLocationMarkerWrapper@@`. Slot 0 of
+that vtable is `FUN_141406690` (357 bytes). The other caller,
+`FUN_141408870`, uses vtable `0x1990F20`, RTTI
+`.?AVQuestSequenceEntityMarkerWrapper@@`, slot 0 `FUN_1414091b0`
+(64 bytes). Both append `this` onto the array of the pointer they
+were given. That owner is not the `Scene` job: `FUN_141405880`
+grows a separate array at `[RSI+0x90]` / `[RSI+0x98]`. Those two
+slot-0 functions are not the call at `0xA9F981`.
+
+`FUN_14094bd80` (112 bytes) and `FUN_14094be00` (104 bytes) are a
+different use of the same offsets. `FUN_14094bd80` links a node
+(`MOV qword ptr [RDI+0x2e8],RSI` when the tail is null, else
+`MOV qword ptr [RAX+0x8],RSI`) and `FUN_14094be00` walks
+`[node+0x8]` calling the pointer stored at `node+0x10`. The node
+built at `0x94B918` writes `0x961110`, which is not an RTTI
+vtable. The second pointer in that node, `0x18AD850`, names
+`ParameterSet`, and its slot 0 is `FUN_1409734a0` (87 bytes), a
+destructor. That list is not the array walk at `0xA9F981`.
+
+`FUN_140a9f910` is not a `Scene` vtable slot. The seven `Scene`
+vtables (`0x18C6CF8` and the six siblings the constructor
+installs) have 8-to-12-byte slot-0 thunks. None of the first
+twelve slots mentions `+0x2e8` or `+0x2f0`. The two collection
+slot-0 functions are `FUN_140a9a400`
+(`NonStreamingSceneObjectCollection`) and `FUN_140a9a470`
+(`StreamingSceneObjectCollection`). The references at `0x1BE4614`,
+`0x1BE4670` and `0x8C0E28C` are unwind bytes (`10 f9 a9 00`), not
+calls. A byte scan of executable memory found an `E9` at
+`0xAAA4C0` whose displacement lands on `0xA9F910`, and the qword
+`0x140AAA4C0` is stored once, at RVA `0x2120E68`, beside the
+pointer to type record RVA `0x2107110`. That record's name at
+`+0x40` reads `MsgEntityAddedToScene` (size dword `0x68`). The
+listing has no instruction at `0xAAA4C0`, so that store is not a
+proven call. It does name the message this function handles. It
+does not name the object in the array.
+
+No instruction found in these passes stores a listener pointer
+into the array the `Scene` constructor zeroes and `FUN_140a9f910`
+walks. The four globals we hold are not loaded by the constructor
+or by `FUN_1400fe310`. An allocated `ControlledEntity` does not
+fill `RCX` of the virtual call.
+
+Miss. The slot-0 target is not named, and nothing in the named
+functions inserts the entity.
+
+The single next decompile is the caller of `FUN_1400fe310` whose
+vector is the `Scene` `FUN_140a99f10` constructs (the `RCX` of
+`FUN_140a9f910`), not the quest-marker owners above. The question
+is the vtable of the pointer it passes in `RDX`. That vtable's
+slot 0 is the call at `0xA9F981`. No call until that vtable is
+read from the bytes.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
