@@ -3908,6 +3908,100 @@ until that use is named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140d737a0` reads the entity and never stores it (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pga.java` through `Slot2f0pgh.java`;
+reports `local/pgslot.txt`, `local/pgslotb.txt` through
+`local/pgslotg.txt`, `local/pgsloth.txt`). No re-analysis, no symbol
+scan, no inject, no launch, nothing written under `M:\`. No new probe
+mode. No store writes the entity into a manager, so no call frame was
+emitted.
+
+`FUN_140d737a0` is 353 bytes. `RCX` is the `PlayerGame`. It is saved
+to `R15` at entry and stays there. The slot pointer at
+`PlayerGame::vftable+0x20` (`0x18FBDA0`) is this function.
+
+```
+RVA 0xD737B6 MOV R15,RCX
+RVA 0xD737C6 MOV R14,qword ptr [R15 + 0x30]
+```
+
+`R14` is the entity. After that load it is used three times, all as a
+base, and then popped. It is not copied, not stored, not passed, and
+not returned:
+
+```
+RVA 0xD737DC MOVSXD RAX,dword ptr [R14 + 0x20]
+RVA 0xD737E0 MOV RBX,qword ptr [R14 + 0x28]
+RVA 0xD7391F MOV RBX,qword ptr [R14 + 0x28]
+RVA 0xD7394C POP R14
+RVA 0xD73952 RET
+```
+
+`[entity+0x20]` is a count and `[entity+0x28]` is the array it
+indexes. Each element is `0x18` bytes. The five calls after the load
+take an element, the `PlayerGame`, or a stack slot. None takes `R14`:
+
+| at | callee | arguments |
+|---|---|---|
+| `0xD7383F` | `FUN_14033a370` (916 bytes) | `RCX` from `[0x14897A5C8]`, `RDX` = `[element+0x10]` |
+| `0xD738EF` | `FUN_140108550` (116 bytes) | `RCX` = the element |
+| `0xD73909` | `memcmp` | `RCX` = `[element]`, `RDX` = the type at `0x1CAABF0` |
+| `0xD7392A` | `FUN_140d77560` (154 bytes) | `RCX` = the `PlayerGame`, `RDX` = `element+8` |
+| `0xD73934` | `FUN_140107850` (189 bytes) | `RCX` = a stack slot |
+
+None of those five references `EntityManagerGame*` (`0x8982C40`),
+`SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*` (`0x8982C80`),
+so none was opened. `RAX` at the `RET` is whatever `FUN_140107850`
+left. The `POP R14` restores the caller's register.
+
+The two calls before the load are already walked and do not receive
+`R14`. `FUN_140914010` at `0xD737B9` gets the `PlayerGame`.
+`FUN_140d73960` at `0xD737C1` gets the `PlayerGame` and reads
+`[PlayerGame+0x30]` itself; that is the deck chain, already closed.
+
+Miss. This function reads two fields of the entity and writes
+neither the entity, a parent pointer, nor a model slot.
+
+`PlayerGame::vftable` (`0x18FBD80`) has 18 code slots, `+0` through
+`+0x88`. The qword at `+0x90` is VA `0x141A865D0` and is not
+executable, so the table ends there. The only slot that loads
+`[PlayerGame+0x30]` is `+0x20`, this function. The other three
+vtables `FUN_140d73270` writes (`0x18FB308`, `0x18FBF48`,
+`0x18FBEF0`) have 2, 3 and 4 code slots, and none of them loads
+`[this+0x30]` either.
+
+One hop from every slot of `0x18FBD80`: the only callees entered
+with the `PlayerGame` that then load `[it+0x30]` are `FUN_140914010`
+and `FUN_140d73960`, both already closed. The one remaining slot
+that loads a manager while holding the `PlayerGame` is `+0x40`.
+`FUN_140d75c40` (184 bytes) calls `FUN_140d75d60` (2917 bytes) at
+`0xD75CEA` with `RCX` = the `PlayerGame` (`MOV RCX,RBX`, and `RBX`
+is `RCX` from `0xD75C57`). `FUN_140d75d60` saves that to `R15`
+(`MOV R15,RCX` at `0xD75D79`) and loads `PlayerManager*`:
+
+```
+RVA 0xD767A9 MOV RCX,qword ptr [0x148982c80]
+RVA 0xD767B0 LEA RDX,[0x1420f76b0]
+RVA 0xD767B7 CALL 0x140916a80
+```
+
+`0xD767A9 + 7 + 0x07C0C4D0 = 0x8982C80`. That call passes the
+manager and a constant, not the entity. The function body has no
+`MOV reg, [R15+0x30]`, and one hop through its direct callees finds
+none entered with the `PlayerGame` that then loads `[it+0x30]`.
+
+The single next decompile is `FUN_140d75d60` (`0xD75D60`, 2917
+bytes), reached from `PlayerGame::vftable+0x40`. The question is
+what `FUN_1400fe310` is given at `0xD76717`: whether `RDX` is the
+entity from `[PlayerGame+0x30]`, or some other pointer. No call
+until that argument is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
