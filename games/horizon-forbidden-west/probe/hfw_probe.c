@@ -97,10 +97,28 @@
  * Table is [EntityManagerGame+0x1d8], count at +0x1e4, stride
  * 0x20. EntityManagerGame* is RVA 0x8982C40. First free slot in
  * 0..63 wins. All 64 taken returns without the call. Then one
- * call, inside the same SEH: FUN_140901310(RCX unused, RDX =
- * entity, R8 = 1, R9 = 0, 5th = 0). R8 = 1 skips [entity+0x68].
- * entity+0xD8 is not written. FUN_1402250c0, FUN_14134c950,
- * FUN_1413d8470 and FUN_14101bd70 are not called.
+ * call, inside the same SEH: FUN_140911320, the insert at
+ * 0x901583, and not FUN_140901310. The frame, from the bytes
+ * immediately before that CALL:
+ * RCX = &[EntityManagerGame+0x1d8]
+ * (LEA RCX,[R15+0x1d8] at 0x901571; R15 is the manager)
+ * RDX = &out iterator (LEA RDX,[RBP-0x39] at 0x90157F)
+ * R8 = CRC32 of the 16 key bytes, low dword
+ * (MOV R8,R14 at 0x901560, CRC32 R8,[R9] at 0x901568,
+ * MOV R8D,R8D at 0x90156E, CRC32 R8,[R9+8] at 0x901578).
+ * Those two CRC32s are the whole hash. No helper.
+ * R9 = &[entity+0x8] (LEA R9,[RBX+8] at 0x90154E)
+ * [RSP+0x20] = &saved entity pointer
+ * (LEA RAX,[RBP+0x67] at 0x901557, MOV [RSP+0x20],RAX at
+ * 0x901563). [RBP+0x67] is FUN_140901310's saved RDX, the
+ * entity. FUN_140911320 reads it at [RSP+0x60] (0x9114DD)
+ * and stores the qword at [record+0x10] (0x9114F0).
+ * [RSP+0x28] and [RSP+0x30] are 0 (MOV byte [RSP+0x28],R14B
+ * at 0x90155B, MOV byte [RSP+0x30],R14B at 0x901552; R14 is
+ * XOR'd at 0x9013C5).
+ * FUN_140901310, FUN_140abe130, FUN_140da2ae0, FUN_140986bc0,
+ * FUN_1402250c0, FUN_14134c950, FUN_1413d8470 and FUN_14101bd70
+ * are not called. entity+0xD8 is not written.
  *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
@@ -132,6 +150,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <nmmintrin.h>
 
 #define RVA_PLAYER_MANAGER 0x8982C80ull
 #define RVA_SCENE_MANAGER 0x8982DD0ull
@@ -179,15 +198,20 @@
 #define RVA_PLACE_CONTROLLED 0x11A0980ull
 #define RVA_LINK_PLAYER 0xD73270ull
 
-/* FUN_140901310. R8 = 1 skips the [entity+0x68] read at 0x901426.
- * R9 = 0 skips the virtual at 0x901416. The 5th stack arg is unused
- * by the insert. EntityManagerGame* is the global at 0x8982C40.
+/* FUN_140911320, called alone. The previous probe called
+ * FUN_140901310 and the process died after the insert: occupied
+ * went 2229 -> 2230, then MOV RAX,[RDX+0x68] at 0xDA2AE9
+ * (FUN_140da2ae0, AIManagerGame slot +0x48, call at 0x901814).
+ * EntityManagerGame* is the global at 0x8982C40.
  * The hash table FUN_140911320 compares is [em+0x1d8], count at
  * +0x1e4, stride 0x20. The 16-byte key is [record+0], not
  * [[record+0x10]+0x8]: CMP [RBX],R8 / CMP [RBX+0x8],R9 at
- * 0x911477 / 0x911470, and R8/R9 were loaded from the key pointer. */
+ * 0x911477 / 0x911470, and R8/R9 were loaded from the key pointer.
+ * CRC32 is the two instructions at 0x901568 and 0x901578, not a
+ * helper: _mm_crc32_u64 from 0, then the low 32 bits, then the
+ * second qword. SSE4.2, polynomial 0x11EDC6F41. */
 #define RVA_ENTITY_MANAGER 0x8982C40ull
-#define RVA_REGISTER_ENTITY 0x901310ull
+#define RVA_HASH_INSERT 0x911320ull
 #define OFF_EM_TABLE 0x1d8
 #define OFF_EM_OCCUPIED 0x1e0
 #define OFF_EM_COUNT 0x1e4
@@ -263,8 +287,12 @@ typedef unsigned long long (__fastcall *alloc_fn)(unsigned long long size);
 typedef unsigned long long (__fastcall *record_fn)(unsigned long long record);
 typedef void (__fastcall *place_fn)(unsigned long long record, unsigned long long block);
 typedef unsigned long long (__fastcall *link_fn)(unsigned long long block, unsigned long long entity);
-typedef void (__fastcall *register_fn)(unsigned long long unused, unsigned long long entity,
- unsigned long long mode, unsigned long long mode2, unsigned long long fifth);
+/* FUN_140911320 at the 0x901583 frame. R8 is a dword (MOV R8D,R8D
+ * at 0x90156E). The two bytes at [RSP+0x28] and [RSP+0x30] are 0. */
+typedef unsigned long long *(__fastcall *hash_insert_fn)(
+ unsigned long long table, unsigned long long *out_iter,
+ unsigned int crc, const unsigned char *key,
+ const unsigned long long *entity_slot, unsigned char zero_a, unsigned char zero_b);
 
 /* One shot. Four inner steps of FUN_1401f82b0, not the factory.
  * The factory is not called: its RCX is a parent container the probe
@@ -456,9 +484,22 @@ static int key_present(unsigned long long table, unsigned int count, const unsig
  return 0;
 }
 
+/* CRC32 of the 16 key bytes, matching 0x901560..0x901578:
+ * MOV R8,R14 (R14 is 0), CRC32 R8,[R9], MOV R8D,R8D,
+ * CRC32 R8,[R9+8]. No helper. */
+static unsigned int uuid_crc32(const unsigned char key[16])
+{
+ unsigned long long lo;
+ unsigned long long hi;
+ memcpy(&lo, key, 8);
+ memcpy(&hi, key + 8, 8);
+ return (unsigned int)_mm_crc32_u64(_mm_crc32_u64(0, lo), hi);
+}
+
 /* One shot. Alloc a ControlledEntity, write a free MD5 key at
- * [entity+0x8], then FUN_140901310 once. FUN_140986bc0 is not called:
- * it allocates its own entity before the store. */
+ * [entity+0x8], then FUN_140911320 once. FUN_140901310 is not
+ * called: its notify faults. FUN_140986bc0 is not called: it
+ * allocates its own entity before the store. */
 static DWORD WINAPI register_entity(LPVOID unused)
 {
  FILE *fp;
@@ -512,7 +553,7 @@ static DWORD WINAPI register_entity(LPVOID unused)
 
  if (!module) {
  fprintf(fp,
- "register-entity timeout. FUN_140901310 not called.\n");
+ "register-entity timeout. FUN_140911320 not called.\n");
  fflush(fp);
  fclose(fp);
  return 0;
@@ -528,14 +569,14 @@ static DWORD WINAPI register_entity(LPVOID unused)
  pm, player, live);
  if (!pm || !live) {
  fprintf(fp,
- "register-entity stop no parent. FUN_140901310 not called.\n");
+ "register-entity stop no parent. FUN_140911320 not called.\n");
  fflush(fp);
  fclose(fp);
  return 0;
  }
  if (!rd_bytes(live + OFF_ENTITY_UUID, parent, 16)) {
  fprintf(fp,
- "register-entity stop parent read fault. FUN_140901310 not called.\n");
+ "register-entity stop parent read fault. FUN_140911320 not called.\n");
  fflush(fp);
  fclose(fp);
  return 0;
@@ -551,7 +592,7 @@ static DWORD WINAPI register_entity(LPVOID unused)
  em, table, count_before, occupied_before);
  if (!em || !table) {
  fprintf(fp,
- "register-entity stop no table. FUN_140901310 not called.\n");
+ "register-entity stop no table. FUN_140911320 not called.\n");
  fflush(fp);
  fclose(fp);
  return 0;
@@ -565,7 +606,7 @@ static DWORD WINAPI register_entity(LPVOID unused)
  if (!count_before || count_before > REGISTER_SCAN_CAP) {
  fprintf(fp,
  "register-entity stop bucket count %u unusable. "
- "FUN_140901310 not called.\n",
+ "FUN_140911320 not called.\n",
  count_before);
  fflush(fp);
  fclose(fp);
@@ -583,7 +624,7 @@ static DWORD WINAPI register_entity(LPVOID unused)
  if (!found) {
  fprintf(fp,
  "register-entity stop all %d slots collide count=%u. "
- "FUN_140901310 not called.\n",
+ "FUN_140911320 not called.\n",
  REGISTER_SLOT_CAP, count_before);
  fflush(fp);
  fclose(fp);
@@ -596,14 +637,26 @@ static DWORD WINAPI register_entity(LPVOID unused)
  record_fn size_from = (record_fn)(base + RVA_SIZE_FROM_RECORD);
  alloc_fn alloc = (alloc_fn)(base + RVA_ALLOC);
  place_fn place = (place_fn)(base + RVA_PLACE_CONTROLLED);
- register_fn reg = (register_fn)(base + RVA_REGISTER_ENTITY);
+ hash_insert_fn insert = (hash_insert_fn)(base + RVA_HASH_INSERT);
+ unsigned long long saved_entity;
+ unsigned long long iter[4];
+ unsigned char zero_a = 0;
+ unsigned char zero_b = 0;
  ctor = ctor_from(record);
  size = (unsigned int)size_from(record);
  entity = alloc((unsigned long long)size);
  if (entity) {
  place(record, entity);
  memcpy((void *)(entity + OFF_ENTITY_UUID), key, 16);
- reg(0, entity, 1, 0, 0);
+ saved_entity = entity;
+ memset(iter, 0, sizeof(iter));
+ /* Frame at 0x901583. RCX = &[em+0x1d8], RDX = &iter,
+ * R8 = CRC32 of the 16 key bytes, R9 = &[entity+0x8],
+ * 5th = &saved_entity (the qword there is the entity),
+ * 6th and 7th are the zero bytes at [RSP+0x28]/[RSP+0x30]. */
+ insert(em + OFF_EM_TABLE, iter, uuid_crc32(key),
+ (const unsigned char *)(entity + OFF_ENTITY_UUID),
+ &saved_entity, zero_a, zero_b);
  }
  } __except (EXCEPTION_EXECUTE_HANDLER) {
  seh = (unsigned int)GetExceptionCode();

@@ -5741,6 +5741,69 @@ The single next fix: the record is complete, so the next probe calls
 `FUN_140911320` alone with the frame at `0x901583` and does not call
 `FUN_140abe130` or `FUN_140da2ae0`.
 
+### `--register-entity` calls `FUN_140911320` alone (2026-10-22)
+
+The call at `0x901583` is fully named from the bytes of
+`HorizonForbiddenWest.exe` (image base `0x140000000`, the copy under
+`local/workspace/hfw-binaries`). `R15` is `EntityManagerGame*`
+(`MOV R15, [rip+0x8081900]` at `0x901339`, which is VA `0x148982C40`,
+RVA `0x8982C40`). `RBX` is the entity (`MOV RBX, [RBP+0x67]` at
+`0x9013AF`). `R14` is zero (`XOR R14D, R14D` at `0x9013C5`).
+
+```
+RVA 0x90154E 4c8d4b08             LEA R9,[RBX + 0x8]
+RVA 0x901552 4488742430           MOV byte ptr [RSP + 0x30],R14B
+RVA 0x901557 488d4567             LEA RAX,[RBP + 0x67]
+RVA 0x90155B 4488742428           MOV byte ptr [RSP + 0x28],R14B
+RVA 0x901560 4d8bc6               MOV R8,R14
+RVA 0x901563 4889442420           MOV qword ptr [RSP + 0x20],RAX
+RVA 0x901568 f24d0f38f101         CRC32 R8,qword ptr [R9]
+RVA 0x90156E 458bc0               MOV R8D,R8D
+RVA 0x901571 498d8fd8010000       LEA RCX,[R15 + 0x1d8]
+RVA 0x901578 f24d0f38f14108       CRC32 R8,qword ptr [R9 + 0x8]
+RVA 0x90157F 488d55c7             LEA RDX,[RBP + -0x39]
+RVA 0x901583 e898fd0000           CALL 0x140911320
+```
+
+| register | value, from those instructions |
+|---|---|
+| `RCX` | `&[EntityManagerGame+0x1d8]`. `R15` is the manager. |
+| `RDX` | `&[RBP-0x39]`, the out iterator. `FUN_140911320` writes it (`MOV [R14], R15` at `0x9114E6`). Nothing reads it before the call. |
+| `R8` | CRC32 of the 16 key bytes, low dword. `R14` is 0, then `CRC32 R8, [R9]` and `CRC32 R8, [R9+8]`, with `MOV R8D, R8D` between them. Those two instructions are the whole hash. There is no helper. |
+| `R9` | `&[entity+0x8]`, the 16 key bytes. |
+| `[RSP+0x20]` | `&[RBP+0x67]`. That slot is `FUN_140901310`'s saved `RDX` (`MOV [RSP+0x10], RDX` at `0x90131F`, then `PUSH RBP` and `LEA RBP, [RSP-0x2f]`), and the qword there is the entity. |
+| `[RSP+0x28]` | 0 (`R14B`). |
+| `[RSP+0x30]` | 0 (`R14B`). |
+
+`FUN_140911320` pushes `RDI`, `R14`, `R15` and subtracts `0x20`, so
+the caller's `[RSP+0x20]` is `[RSP+0x60]` at `MOV RAX, [RSP+0x60]`
+(`0x9114DD`, bytes `48 8B 44 24 60`). `MOV RCX, [RAX]` /
+`MOV [RBX+0x10], RCX` at `0x9114ED` / `0x9114F0` stores the entity.
+`INC [R15+8]` at `0x9114F7` is the occupied increment. The CRC is
+`_mm_crc32_u64` twice (SSE4.2, polynomial `0x11EDC6F41`), starting
+from zero, then the low 32 bits. The probe computes that itself and
+calls `FUN_140911320` only.
+
+`--register-entity` still allocates the `0x300` `ControlledEntity`,
+writes the MD5 key at `[entity+0x8]`, and returns without the call
+when the live player, the manager, or the table is null, or all 64
+slots collide. It does not call `FUN_140901310`, `FUN_140abe130`,
+`FUN_140da2ae0`, `FUN_140986bc0`, `FUN_1402250c0`, `FUN_14134c950`,
+`FUN_1413d8470` or `FUN_14101bd70`, and it does not write
+`entity+0xD8`.
+
+Not run. No launch, no inject, nothing written under `M:\`. Release
+build of `games/horizon-forbidden-west/probe/hfw-probe.csproj`
+(`net10.0`). One run, game open, save loaded, borderless fullscreen:
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','M:\Horizon Forbidden West\HorizonForbiddenWest.exe','--register-entity'
+```
+
+from `games/horizon-forbidden-west/probe/bin/Release/net10.0`. Log is
+`hfw-probe.log` in the game's working directory. Look for
+`seh=0x00000000` and `occupied_after = occupied_before + 1`.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)

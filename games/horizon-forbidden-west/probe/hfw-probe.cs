@@ -98,10 +98,13 @@
 // (count at +0x1e4, stride 0x20, EntityManagerGame* at RVA
 // 0x8982C40) is skipped. The first free slot in 0..63 is used. All
 // 64 taken returns without the call. Then, inside the same SEH,
-// FUN_140901310(RCX unused, RDX = entity, R8 = 1, R9 = 0, 5th = 0).
-// R8 = 1 skips [entity+0x68]. entity+0xD8 is not written.
-// FUN_1402250c0, FUN_14134c950, FUN_1413d8470 and FUN_14101bd70 are
-// not called. The line to look for is
+// FUN_140911320 with the frame at 0x901583: RCX = &[EntityManagerGame+0x1d8],
+// RDX = &out iterator, R8 = CRC32 of the 16 key bytes (the two CRC32
+// instructions at 0x901568 and 0x901578, not a helper), R9 = &[entity+0x8],
+// 5th = &saved entity pointer, 6th and 7th = 0. FUN_140901310 is not
+// called. entity+0xD8 is not written. FUN_140986bc0, FUN_140abe130,
+// FUN_140da2ae0, FUN_1402250c0, FUN_14134c950, FUN_1413d8470 and
+// FUN_14101bd70 are not called. The line to look for is
 // "register-entity slot=.. key=.. entity=0x.. seh=0x00000000 count_before=.. count_after=..".
 // --add-player stays alloc-only. --link-puppet is unchanged.
 //
@@ -345,8 +348,10 @@ internal static class Program
  {
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=register-entity. " +
  "one shot: the four inner steps, then a free MD5 key stored at [entity+0x8], " +
- "then FUN_140901310(unused, entity, 1, 0, 0) once, then exit. " +
- "FUN_140986bc0 is not called. FUN_1402250c0, FUN_14134c950, FUN_1413d8470 " +
+ "then FUN_140911320 once (RCX=&[EntityManagerGame+0x1d8], RDX=&iterator, " +
+ "R8=CRC32 of the 16 key bytes, R9=&[entity+0x8], 5th=&saved entity), then exit. " +
+ "FUN_140901310, FUN_140986bc0, FUN_140abe130 and FUN_140da2ae0 are not called. " +
+ "FUN_1402250c0, FUN_14134c950, FUN_1413d8470 " +
  "and FUN_14101bd70 are not called. entity+0xD8 is not written. " +
  "log is hfw-probe.log in the game's working directory. " +
  "start a fresh session, load a save first. " +
@@ -423,7 +428,7 @@ internal static class Program
  // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam,
  // 5 alloc-entity (four inner steps, factory not called),
  // 6 link-puppet (four steps, then FUN_140d73270 with the new entity),
- // 7 register-entity (four steps, MD5 key, then FUN_140901310 once).
+ // 7 register-entity (four steps, MD5 key, then FUN_140911320 once).
  File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
