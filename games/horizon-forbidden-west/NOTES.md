@@ -5603,6 +5603,144 @@ The single next fix: the hash record is already linked, so skip
 at `[EntityManagerGame+0x1f18]`, `RDX` = the entity) on its own,
 which is the notify `0x9017E9` still has to finish.
 
+### `FUN_140abe130` returns on the empty map; the fault is `MOV [RDX+0x68]` at `0xDA2AE9` (2026-10-22)
+
+`FUN_140abe130` is 313 bytes and returns before it reads a
+component. The first load of a pointer the constructor leaves zero,
+which is then dereferenced, is not in that function and not
+`[[0x148983128]+0x220]`. It is `MOV RAX, qword ptr [RDX+0x68]` at
+`0xDA2AE9`, the first instruction of `FUN_140da2ae0`. `RDX` is the
+entity. `[entity+0x68]` is zero on a constructor-fresh
+`ControlledEntity` (`R8 = 1` already skipped the same field at
+`0x901426`, and the probe writes 16 bytes at `entity+0x8` only).
+The next instruction is `TEST RAX, RAX`, and the zero arm falls
+through to `XOR EAX, EAX` / `CMP byte ptr [RAX+0x22], 0`. That is
+the `0xC0000005`.
+
+`FUN_140abe130` does not load the template global. Every `CALL`, and
+every load that names the entity (`RSI` is `RDX`):
+
+```
+RVA 0xABE142 LEA RCX,[RDX + 0xa0]
+RVA 0xABE149 LEA RDX,[0x142124320]
+RVA 0xABE150 CALL 0x1408fa230
+RVA 0xABE155 TEST RAX,RAX
+RVA 0xABE158 JZ 0x140abe261
+RVA 0xABE188 CALL qword ptr [0x14174b2f8]
+RVA 0xABE195 CALL qword ptr [0x14174b1c8]
+RVA 0xABE19B MOV RBX,qword ptr [R13 + 0x8]
+RVA 0xABE1A2 MOVSXD RDI,dword ptr [R13]
+RVA 0xABE1F6 CALL 0x140911320
+RVA 0xABE20C CRC32 R14,qword ptr [RSI + 0x8]
+RVA 0xABE21A CRC32 R8,qword ptr [R9 + 0x8]
+RVA 0xABE22F CALL 0x1401ecd50
+RVA 0xABE253 CALL qword ptr [0x14174b1c0]
+RVA 0xABE268 RET
+```
+
+`FUN_1408fa230`'s first load is still `MOV R9, [RCX+0x18]`, which is
+`[entity+0xb8]`. The count is `[entity+0xb0]`. Both are zero
+(`XOR EBP, EBP` at `0x948A2A`, then `MOV [RCX+0xb0], RBP` and
+`MOV [RCX+0xb8], RBP`). `TEST R8D, R8D` / `JLE 0x1408fa28a` skips
+the walk, and `CMP R9, RBX` / `JZ 0x1408fa2b4` returns
+`XOR EAX, EAX`. No path in that lookup reads a component when the
+count is 0. `JZ 0x140abe261` is `FUN_140abe130`'s `RET`. The loads
+at `0xABE19B`, `0xABE1A2`, `0xABE20C` and the call at `0xABE22F` are
+behind that test.
+
+The global at VA `0x148983128` (RVA `0x8983128`) is not
+`GameModule` (`0x8983150`). Its one store is
+`MOV qword ptr [0x148983128], RAX` at `0xD3072F` in `FUN_140d2fca0`.
+The object it publishes is `GameLibSystemAssets`: `FUN_140d49bd0`
+writes `LEA RAX, [0x1418fafa8]` / `MOV [RCX], RAX` at `0xD49BDC` /
+`0xD49BE7`, and the Complete Object Locator at `0x1418FAFA8 - 8`
+(`0x141A82BE8`, type descriptor RVA `0x22852B8`) names
+`.?AVGameLibSystemAssets@@`. `+0x220` is a qword slot in that
+object, not a vtable and not a function pointer. The constructor
+zeroes it with the rest of the object:
+
+```
+RVA 0xD49BD0 XOR EDX,EDX
+RVA 0xD49D8E MOV qword ptr [RCX + 0x220],RDX
+```
+
+That store is the constructor, not the steady state. The only later
+use of `+0x220` in the functions that already reference the global
+is the load `MOV RSI, [RAX+0x220]` at `0xD5EFF6` in `FUN_140d5e2c0`.
+The image qword at `0x8983128` is zero, so this pass cannot say
+whether a live game has filled `+0x220`. `FUN_140abe130` never
+loads it, so the zero is not this fault.
+
+The call that does fault is after the listener returns. The loop
+advances and then, if the global is non-null, calls slot `+0x48`:
+
+```
+RVA 0x9017E9 CALL qword ptr [RAX]
+RVA 0x9017EB ADD RBX,0x8
+RVA 0x9017EF CMP RBX,RSI
+RVA 0x9017F2 JNZ 0x1409017e0
+RVA 0x901802 MOV RCX,qword ptr [0x148982fe8]
+RVA 0x901809 TEST RCX,RCX
+RVA 0x90180C JZ 0x140901817
+RVA 0x90180E MOV RAX,qword ptr [RCX]
+RVA 0x901811 MOV RDX,RDI
+RVA 0x901814 CALL qword ptr [RAX + 0x48]
+```
+
+`0x148982FE8` (RVA `0x8982FE8`) is `AIManagerGame*`.
+`FUN_140da07a0` writes `LEA RAX, [0x1419003a8]` /
+`MOV [R14], RAX` at `0xDA07C6` / `0xDA07D4`, and the Complete Object
+Locator at `0x1419003A8 - 8` (`0x141A871F0`, type descriptor RVA
+`0x2287618`) names `.?AVAIManagerGame@@`. Slot `+0x48` is
+`FUN_140da2ae0`. `RDI` is the entity. The first instruction
+dereferences `[entity+0x68]` with no null return:
+
+```
+RVA 0xDA2AE9 MOV RAX,qword ptr [RDX + 0x68]
+RVA 0xDA2AF0 TEST RAX,RAX
+RVA 0xDA2AF3 JZ 0x140da2b0f
+RVA 0xDA2B0F XOR EAX,EAX
+RVA 0xDA2B11 CMP byte ptr [RAX + 0x22],0x0
+```
+
+The hash record is already complete without the listener and without
+this call. Occupied went `2229 -> 2230` at `INC [R15+0x8]`
+(`0x9114F7`), and `MOV [RBX+0x10], RCX` at `0x9114F0` stored the
+entity. Nothing between that store and `0x9017E9` writes the record.
+A later probe that wants the same record without the listener calls
+`FUN_140911320` with the arguments of the call at `0x901583`:
+
+```
+RVA 0x90154E LEA R9,[RBX + 0x8]
+RVA 0x901552 MOV byte ptr [RSP + 0x30],R14B
+RVA 0x901557 LEA RAX,[RBP + 0x67]
+RVA 0x90155B MOV byte ptr [RSP + 0x28],R14B
+RVA 0x901560 MOV R8,R14
+RVA 0x901563 MOV qword ptr [RSP + 0x20],RAX
+RVA 0x901568 CRC32 R8,qword ptr [R9]
+RVA 0x901571 LEA RCX,[R15 + 0x1d8]
+RVA 0x901578 CRC32 R8,qword ptr [R9 + 0x8]
+RVA 0x90157F LEA RDX,[RBP + -0x39]
+RVA 0x901583 CALL 0x140911320
+```
+
+`RCX` is `&[EntityManagerGame+0x1d8]`. `RDX` is the out iterator.
+`R8` is the CRC32 of `[entity+0x8]` and `[entity+0x10]`. `R9` is
+`&[entity+0x8]`. `[RSP+0x20]` is the address of the saved entity
+pointer, and `[record+0x10]` receives that pointer. `[RSP+0x28]` and
+`[RSP+0x30]` are zero. Not emitted.
+
+Offline only. Five `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegFault28.java` through `RegFault32.java`,
+reports `local/regfault28.txt` through `local/regfault32.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. The probe was not changed. `FUN_1402250c0`,
+`FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70` stay uncalled.
+
+The single next fix: the record is complete, so the next probe calls
+`FUN_140911320` alone with the frame at `0x901583` and does not call
+`FUN_140abe130` or `FUN_140da2ae0`.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
