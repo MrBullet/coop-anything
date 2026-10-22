@@ -4206,6 +4206,108 @@ writes that entity into `PlayerManager*` (`0x8982C80`),
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_1401e5b60` frees a 16-byte slab block, not the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pha.java`, `Slot2f0phb.java`,
+`Slot2f0phc.java`, `Slot2f0phd.java`, `Slot2f0phe.java`,
+`Slot2f0phf.java`, `Slot2f0phg.java`, `Slot2f0phh.java`; reports
+`local/pgslot4.txt` through `local/pgslot4h.txt`). No re-analysis,
+no symbol scan, no inject, no launch, nothing written under `M:\`.
+No new probe mode. No store writes the entity into a manager, so no
+call frame was emitted.
+
+The virtual at `0xD76452` is slot `+0x98` of `AssetMemoryPool`.
+`RCX` is the TLS pool at `GS:[0x58]+0x1A10`, or the static
+`AssetMemoryPool` at RVA `0x1FE1F00` when the pointer is in
+`[0x1FE0510, 0x1FE0518)` or the TLS slot still holds that object.
+`RDX` is `R12`. The object that receives the store after the call
+is not the pool:
+
+```
+RVA 0xD76449 MOV RCX,RAX
+RVA 0xD7644C MOV RAX,qword ptr [RCX]
+RVA 0xD7644F MOV RDX,R12
+RVA 0xD76452 CALL qword ptr [RAX + 0x98]
+RVA 0xD76458 MOV qword ptr [RBX + 0x98],RSI
+RVA 0xD7646C MOV qword ptr [RBX + 0xe8],R15
+```
+
+`R12` is the block `FUN_1401e6100` returned at `0xD75F8D` with
+`ECX = 0x10` (`0xD75F80`). Two `VMOVUPS` copy 16 bytes into it
+(`0xD75FB0`, `0xD75FB9`). It is not the `0x300` entity. `R15` is the
+`PlayerGame` saved at `0xD75D79`. `RBX` is the `EntitySpawnInfo`
+`FUN_140a312c0` returned at `0xD76237` (vtables `0x18BEE50` and
+`0x18BE338`, both `.?AVEntitySpawnInfo@@`). So `[RBX+0xe8]` is
+`[EntitySpawnInfo+0xe8] = PlayerGame`. The entity is not in that
+store.
+
+`AssetMemoryPool::vftable` is RVA `0x17B3148` (COL `0x1419D3468`,
+type descriptor RVA `0x2243378`, `.?AVAssetMemoryPool@@`). Slot
+`+0x98` is `FUN_1401e5b60` (98 bytes, RVA `0x1E5B60`). The function
+aligns `RDX` down to a 1 GiB slab, indexes the `0x40`-byte header
+(`(ptr >> 0x11) * 0x40`), and follows a type byte. Type `5` walks
+back `*(u16*)(header+2)` headers; type `6` walks back and then adds
+`0x40`. Both arms load the owner at `[header+8]` and tail-call its
+own slot `+0x98`:
+
+```
+RVA 0x1E5BB4 MOV RCX,qword ptr [R8 + 0x8]
+RVA 0x1E5BB8 MOV RAX,qword ptr [RCX]
+RVA 0x1E5BBB JMP qword ptr [RAX + 0x98]
+```
+
+The same jump is at `0x1E5B99` on the type-5 arm. `RDX` is never
+written, so the tail is entered with `RCX` = the slab owner and
+`RDX` still the 16-byte pointer. The static pool's own slot `+0x98`
+is this function, so the tail is not a second copy of it. The owner
+is the header of the slab the 16-byte block came from, and that
+header is filled when the slab is allocated. The image copy of the
+fallback pool global (`0x897A388`) is zero, so the tail target has
+no vtable bytes and no RTTI to read. The body has no RIP load of
+`EntityManagerGame*` (`0x8982C40`), `SceneManagerGame*`
+(`0x8982DD0`) or `PlayerManager*` (`0x8982C80`).
+
+The constructor that built the `EntitySpawnInfo` does not close the
+gap. `FUN_140a312c0` (559 bytes) is called at `0xD76232` with the
+`0x240`-byte block from the pool's slot `+0x88` (`0xD761FE`,
+`EDX = 0x240`). It writes the two vtables and zeroes its own
+fields, including `[this+0x30]` (`0xA31315`). No `[reg+0x30]` load
+of an entity, no RIP load of the three managers, four calls, none
+of them an insert. `FUN_140a33470` (127 bytes), called on the same
+object at `0xD76485`, also loads none of the three managers and
+does not read `[this+0xe8]`.
+
+The one later read of that field is not a store of the entity
+either. At `0xD765E6` the code loads `[PlayerGame+0xe8]` (the
+`EntitySpawnInfo`) and copies two bytes, `[it+0x10]` and
+`[it+0x11]`, into a stack record. It then takes the critical
+section at `[0x8982D88]+0x30` and calls slot `+0x8` of
+`[[0x8982D88]+8]+0x18`. That call gets the stack record, not the
+entity, and it does not write `EntityManagerGame`,
+`SceneManagerGame` or `PlayerManager`.
+
+Miss. The tail frees the 16-byte block. Nothing on this path writes
+the `0x300` entity into a manager, a parent pointer, or a model
+slot.
+
+The single next decompile is the function at slot `+0x8` of
+`[[0x8982D88]+8]+0x18`, called at `0xD7668C`. `RCX` is that object
+and `RDX` is the stack record at `[RSP+0x30]`, whose first qword was
+set to RVA `0x18FB7A0` at `0xD76605`. The `PlayerGame` is still in
+`R15`, and `[PlayerGame+0xe8]` was read two instructions earlier
+(`0xD765E6`). The question is whether that slot loads
+`[PlayerGame+0x30]` and writes the entity into `EntityManagerGame*`
+(`0x8982C40`), `SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*`
+(`0x8982C80`). No call until that load is named. `FUN_140d72230` is
+not the next step: it was already walked and its `+0x30` is not the
+entity. `FUN_14133aa10` is not either: `0xD766C4` passes
+`[GameModule+0x558]`, not the `PlayerGame`.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
