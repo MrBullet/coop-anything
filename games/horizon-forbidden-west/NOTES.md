@@ -4002,6 +4002,88 @@ until that argument is named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140d75d60` appends a global element, not the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pgi.java` through `Slot2f0pgl.java`;
+reports `local/pgslot2.txt`, `local/pgslot2b.txt`,
+`local/pgslot2c.txt`, `local/pgslot2d.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. No store writes the entity into a manager, so no
+call frame was emitted.
+
+`FUN_140d75d60` is 2917 bytes. `RCX` is the `PlayerGame`, saved at
+entry and never used as the source of the append:
+
+```
+RVA 0xD75D79 MOV R15,RCX
+```
+
+The only call of `FUN_1400fe310` in the body is `0xD76717` (53 calls
+walked, one hit). `RDX` is not the entity. It is the current element
+of a counted pointer array in a static block, and `RCX` is that
+block's own second vector, not a field of the `PlayerGame` and not
+one of the three managers:
+
+```
+RVA 0xD766E7 LEA RDI,[0x148959f08]
+RVA 0xD766EE LEA R12,[0x148959f98]
+RVA 0xD766F5 MOVSXD RAX,dword ptr [RDI]
+RVA 0xD766FC MOV RBX,qword ptr [RDI + 0x8]
+RVA 0xD76700 LEA RSI,[RBX + RAX*0x8]
+RVA 0xD76710 MOV RDX,qword ptr [RBX]
+RVA 0xD76713 LEA RCX,[RDI + 0x10]
+RVA 0xD76717 CALL 0x1400fe310
+RVA 0xD7671C ADD RBX,0x8
+```
+
+`RDI` starts at `0x8959F08` and steps by `0x30` until `0x8959F98`,
+three records. Each record is a count at `+0`, a data pointer at
+`+8`, and the destination vector at `+0x10`. The loop appends every
+element of the first vector onto the second, then zeroes the count
+(`MOV dword ptr [RDI],R13D` at `0xD76725`, and `R13D` was zeroed at
+`0xD75D72`). Nothing in those instructions loads `R15` or
+`[PlayerGame+0x30]`.
+
+The `PlayerManager*` load later in the same function does not close
+the gap. It looks a player up by a constant and never takes the
+entity:
+
+```
+RVA 0xD767A9 MOV RCX,qword ptr [0x148982c80]
+RVA 0xD767B0 LEA RDX,[0x1420f76b0]
+RVA 0xD767B7 CALL 0x140916a80
+```
+
+`0xD767A9 + 7 + 0x07C0C4D0 = 0x8982C80`. `RAX` is then read at `+0x48`
+and `+0xa0` (`0xD767C4`, `0xD767C8`) and handed to `FUN_1408fa230`
+with another constant (`LEA RDX,[0x1421ea6d0]` at `0xD767CF`). The
+two calls after that which still hold the `PlayerGame` were opened
+only to check the entity and the three managers. `FUN_140d768d0`
+(617 bytes, `MOV RCX,R15` at `0xD76844`, call at `0xD76847`) saves
+`RCX` to `RSI` and has no `[reg+0x30]` load and no RIP load of
+`EntityManagerGame*` (`0x8982C40`), `SceneManagerGame*`
+(`0x8982DD0`), `PlayerManager*` (`0x8982C80`) or `GameModule*`
+(`0x8983150`). `FUN_141211f00` (273 bytes, call at `0xD7681D`) is
+entered with `RCX` = `[GameModule+0x1c8]` and `RDX` left from the
+lookup above; its `[RBP+0x30]` is that argument's own field, and it
+loads none of those four globals either.
+
+Miss. This function drains a static pointer array into a second
+static vector. It does not write the entity into `EntityManagerGame`,
+`SceneManagerGame`, `PlayerManager`, or a counted world list.
+
+The single next decompile is `FUN_140916a80`, called at `0xD767B7`
+with `RCX` = `PlayerManager*` and `RDX` = the constant at
+`0x20F76B0`. The question is whether the object it returns at
+`[RAX+0x48]` is a `PlayerGame`, and whether that object's `+0x30`
+is then written into `PlayerManager`. No call until that return
+value is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
