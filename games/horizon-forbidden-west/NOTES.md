@@ -5352,6 +5352,119 @@ The single next fix: read the vtable before `FUN_140901310` returns
 into the SEH handler, and stop treating the logged zero as the
 constructor's store.
 
+### `R13` at `0x9015A2` is the entity, and that call did not run (2026-10-22)
+
+`R13` at `0x9015A2` is the `0x300` `ControlledEntity` from `RDX`.
+`[R13]` is `ControlledEntity::vftable`. Nothing between the
+constructor's store and this load writes `[entity+0]`, and the
+probe does not either: `hfw_probe.c` copies 16 bytes at
+`entity+0x8` (`memcpy((void *)(entity + OFF_ENTITY_UUID), key, 16)`).
+The fresh-insert status skips `0x9015A9`.
+
+The only write to `R13` in `FUN_140901310` is the load after the
+insert. `PUSH R13` at `0x901327` spills the incoming register;
+`POP R13` at `0x901834` restores it.
+
+```
+RVA 0x90131F MOV qword ptr [RSP + 0x10],RDX
+RVA 0x90132D LEA RBP,[RSP + -0x2f]
+RVA 0x901346 MOV RSI,RDX
+RVA 0x901588 MOV R13,qword ptr [RBP + 0x67]
+RVA 0x9015A2 MOV RAX,qword ptr [R13]
+RVA 0x9015A6 MOV RCX,R13
+RVA 0x9015A9 CALL qword ptr [RAX]
+```
+
+`[RBP+0x67]` is the saved `RDX` (`MOV [RSP+0x10], RDX` at
+`0x90131F`, five pushes, `LEA RBP,[RSP-0x2f]`). The same slot is
+reloaded into `RAX` at `0x901354` and into `RBX` at `0x9013AF` and
+`0x9013FE`. `FUN_140901310` has no `MOV [R13], ...` and no
+`MOV [RBX], ...` / `MOV [RSI], ...` / `MOV [RDI], ...` at offset 0.
+The stores aimed at the entity are `[entity+0x98]` (the locked bit
+sets at `0x901349`, `0x901399`, `0x9013A4`), the position copy at
+`0x901360` / `0x90137E` / `0x90138F`, and nothing at `+0`.
+
+The constructor's store is still the last write of that qword.
+`FUN_140948a10` does put a vtable at `[RCX]` (`MOV [RCX], RAX` at
+`0x948A9F`, then `MOV [RCX], RBP` at `0x948BB9`), but
+`FUN_1411a0980` calls it and then overwrites `+0`:
+
+```
+RVA 0x11A0990 CALL 0x140948a10
+RVA 0x11A0995 LEA RAX,[0x141958958]
+RVA 0x11A099C MOV qword ptr [RBX],RAX
+```
+
+The three callees that see the entity before `0x9015A2` do not
+replace it. `FUN_14094c8b0` (`0x9013B9`) writes `[entity+0x160]` and
+`[entity+0x170]` and tests `[entity+0x70]` (`TEST RCX, RCX` /
+`JZ 0x14094ca2e` at `0x94C9E3`). `ControlledEntity::vftable+0x50` is
+`FUN_14094fd10` (`CALL [RAX+0x50]` at `0x901416`); it ORs
+`[entity+0x98]` and also tests `[entity+0x70]`. `FUN_140ad3b10`
+(`0x9014A8`) writes `[entity+0x220]` and fields off that, not `+0`.
+`FUN_140042570` (`0x90159D`) only formats a log line.
+
+`CALL [RAX]` at `0x9015A9` is the duplicate-key arm, and this run
+did not take it. `FUN_140911320` writes the iterator status at
+`[out+0x10]`, which is `[RBP-0x29]` because the out pointer is
+`LEA RDX,[RBP-0x39]` at `0x90157F`:
+
+```
+RVA 0x9114F0 MOV qword ptr [RBX + 0x10],RCX
+RVA 0x9114F7 INC dword ptr [R15 + 0x8]
+RVA 0x9114FB MOV dword ptr [R14 + 0x10],0x2
+RVA 0x911579 MOV dword ptr [R14 + 0x10],0x1
+RVA 0x91158D MOV dword ptr [R14 + 0x10],0x0
+```
+
+`2` is the empty-slot insert (occupied increments in the same
+straight line). `1` replaces an existing record and does not
+increment. `0` is the duplicate. Occupied went `2229 -> 2230`, so
+the dword is `2`. `R14` in `FUN_140901310` is zero (`XOR R14D, R14D`
+at `0x9013C5`):
+
+```
+RVA 0x90158C CMP dword ptr [RBP + -0x29],R14D
+RVA 0x901590 JNZ 0x140901652
+```
+
+`2 != 0`, so the jump is taken. `0x901596` through `0x9015A9` is
+the fall-through: a log, then slot 0 of the vtable, then the fatal
+`0xdeadca7` at `0x901647`. Slot 0 is `FUN_141186f10`, which returns
+the type record; that call would not fault, and it did not run.
+The inserted record does not need it. `[record+0x10]` already holds
+the entity, and `[hash+0x8]` already counts it.
+
+The path that did run is `0x901652`. It unlocks
+`[EntityManagerGame+0x1e8]`, reloads the entity, and the first call
+back into the entity is `FUN_14094c8b0` at `0x90167C` when bit 23 of
+`[entity+0x98]` is clear (the constructor's `0x93` leaves it clear).
+That function returns. The virtual call after it is the listener
+fanout, not `[R13]`:
+
+```
+RVA 0x9017C6 MOV RBX,qword ptr [R15 + 0x1f18]
+RVA 0x9017E0 MOV RCX,qword ptr [RBX]
+RVA 0x9017E3 MOV RDX,RDI
+RVA 0x9017E6 MOV RAX,qword ptr [RCX]
+RVA 0x9017E9 CALL qword ptr [RAX]
+```
+
+`RDI` is the entity (`MOV RDI,[RBP+0x67]` at `0x90166E`). `RCX` is
+a listener from `[EntityManagerGame+0x1f18]`.
+
+Offline only. Four `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegFault8.java` through `RegFault11.java`,
+reports `local/regfault8.txt` through `local/regfault11.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. The probe was not changed. The call frame is unchanged.
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and
+`FUN_14101bd70` stay uncalled.
+
+The single next fix: follow the taken branch at `0x901652` and name
+the listener virtual call at `0x9017E9`, which is the first
+`CALL [RAX]` the fresh insert actually reaches.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
