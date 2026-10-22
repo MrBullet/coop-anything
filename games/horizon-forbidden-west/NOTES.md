@@ -4916,9 +4916,166 @@ not store `[RCX+0x8]`. That is the next decompile: whether
 `FUN_140949060` writes `[entity+0x8]` and `[entity+0x10]`, and from
 which argument.
 
+### `FUN_140949060` reads the UUID; it does not write it (2026-10-22)
+
+`FUN_140949060` does not write `[entity+0x8]` or `[entity+0x10]`.
+The whole 3511-byte body was walked. The only 16-byte touch of the
+entity is a read, `VMOVUPS XMM6,xmmword ptr [RDI + 0x8]` at
+`0x949341`, copied to a stack slot at `0x949346`. `RDI` is the
+incoming `RCX` (`MOV RDI,RCX` at `0x949093`). The two
+`MOV qword ptr [RCX+0x8],RAX` / `MOV qword ptr [RCX+0x10],RAX` pairs
+at `0x949750` / `0x949754` and `0x9497B0` are a 0x20 record in a
+side array: `RCX` there is `ADD RCX,RAX` after `SHL RCX,0x5` of a
+count at `[RBX+0x58]`, and `RAX` is zeroed by `XOR EAX,EAX` at
+`0x94974E`. Neither is the entity. No probe.
+
+The call frame at `0xB22A32`. `RCX` is the entity:
+
+```
+RVA 0xB2297B MOV RBX,RAX
+RVA 0xB229FC MOV RCX,RBX
+RVA 0xB229FF MOVZX EAX,byte ptr [RDI + 0x30a]
+RVA 0xB22A06 MOV byte ptr [RBX + 0x30a],AL
+RVA 0xB22A0C MOVZX EAX,byte ptr [RDI + 0x30b]
+RVA 0xB22A13 MOV byte ptr [RBX + 0x30b],AL
+RVA 0xB22A19 MOV EAX,dword ptr [RDI + 0x30c]
+RVA 0xB22A1F MOV dword ptr [RBX + 0x30c],EAX
+RVA 0xB22A25 MOVZX EAX,byte ptr [RDI + 0x538]
+RVA 0xB22A2C MOV byte ptr [RBX + 0x538],AL
+RVA 0xB22A32 CALL 0x140949060
+RVA 0xB22A37 XOR R15D,R15D
+RVA 0xB22A3A XOR R9D,R9D
+RVA 0xB22A3D MOV RDX,RBX
+RVA 0xB22A40 MOV qword ptr [RSP + 0x20],R15
+RVA 0xB22A45 LEA R8D,[R15 + 0x1]
+RVA 0xB22A49 CALL 0x140901310
+```
+
+`RDX` and `R8` of `FUN_140949060` are not set in this window. `RDX`
+is still the `XOR EDX,EDX` at `0xB229F4`, so the second argument is
+zero. `R8` is the stack address left by `LEA R8,[RBP + -0x39]` at
+`0xB2296A`, the 16-byte buffer the caller just minted. The function
+takes two arguments (`FUN_140949060(longlong *param_1, longlong
+param_2)`); `R8` is unused. `param_1[1]` and `param_1[2]` are read
+into locals and never stored back.
+
+`RBX` is the entity because it is the return of the call just above:
+
+```
+RVA 0xB22949 LEA RDX,[RDI + 0x8]
+RVA 0xB2294D MOV R9D,0x4
+RVA 0xB22953 LEA R8,[RBP + 0x67]
+RVA 0xB22957 LEA RCX,[RBP + -0x39]
+RVA 0xB2295B CALL 0x14011b2b0
+RVA 0xB22960 LEA RDX,[RDI + 0xd8]
+RVA 0xB22967 MOV RCX,R14
+RVA 0xB2296A LEA R8,[RBP + -0x39]
+RVA 0xB2296E CALL 0x140986bc0
+RVA 0xB22973 MOV R13D,dword ptr [RBP + 0x67]
+RVA 0xB2297B MOV RBX,RAX
+```
+
+`FUN_140986bc0` (407 bytes) is the function that writes the key. It
+does not insert into the hash table at `[EntityManagerGame+0x1d8]`.
+It allocates the entity, copies position, then stores the 16 bytes:
+
+```
+RVA 0x986BD4 MOV RAX,qword ptr [RCX]
+RVA 0x986BD7 MOV RBP,R8
+RVA 0x986BDA MOV RBX,RDX
+RVA 0x986BDD MOV RSI,RCX
+RVA 0x986BE0 CALL qword ptr [RAX + 0x20]
+RVA 0x986BE6 CALL 0x1402034a0
+RVA 0x986BF4 CALL 0x14092ff60
+RVA 0x986BF9 VMOVUPS XMM0,xmmword ptr [RBX]
+RVA 0x986BFD VMOVUPS xmmword ptr [RDI + 0x118],XMM0
+RVA 0x986C3B VMOVUPS XMM0,xmmword ptr [RBP]
+RVA 0x986C46 VMOVUPS xmmword ptr [RDI + 0x8],XMM0
+RVA 0x986C51 CALL qword ptr [RAX + 0x28]
+RVA 0x986D30 MOV RAX,RDI
+RVA 0x986D56 RET
+```
+
+`RDI` is the pointer returned by `FUN_1402034a0` (the same factory
+the allocator uses) and is the value returned in `RAX`. `[RBP]` is
+the third argument, the 16 bytes at `[RBP-0x39]`. The store is one
+`VMOVUPS`, so it writes `[entity+0x8]` and `[entity+0x10]` together.
+The decompiler prints it as `plVar6[1] = *param_3; plVar6[2] =
+param_3[1];`.
+
+Those 16 bytes are not a counter, not a GUID call, and not a copy of
+another entity's key. `FUN_14011b2b0` (280 bytes) hashes them.
+`RCX` is the out buffer. `RDX` is `&[RDI+0x8]`, the parent entity's
+own 16-byte key (`RDI` is the incoming `RCX` of `FUN_140b22790`,
+`MOV RDI,RCX` at `0xB227A4`). `R8` is `&[RBP+0x67]`, a dword set to
+zero at `0xB228FD` (`XOR R15D,R15D` at `0xB227CA`, then
+`MOV dword ptr [RBP+0x67],R15D`). `R9` is `4`, the byte count:
+
+```
+RVA 0x11B2C2 VMOVUPS XMM0,xmmword ptr [RDX]
+RVA 0x11B2D0 MOV dword ptr [RBP + -0x15],0x67452301
+RVA 0x11B2DA MOV dword ptr [RBP + -0x11],0xefcdab89
+RVA 0x11B2E4 MOV dword ptr [RBP + -0xd],0x98badcfe
+RVA 0x11B2EF MOV dword ptr [RBP + -0x9],0x10325476
+RVA 0x11B2FE VMOVUPS xmmword ptr [RBP + 0x7],XMM0
+RVA 0x11B303 CALL 0x1400f44b0
+RVA 0x11B398 VMOVUPS XMM0,xmmword ptr [RBP + -0x29]
+RVA 0x11B39D VMOVUPS xmmword ptr [RBX],XMM0
+RVA 0x11B3A5 AND byte ptr [RBX + 0x8],0x3f
+RVA 0x11B3A9 AND AL,0xf
+RVA 0x11B3AB OR AL,0x30
+RVA 0x11B3AD OR byte ptr [RBX + 0x8],0x80
+RVA 0x11B3B1 MOV byte ptr [RBX + 0x6],AL
+```
+
+`0x67452301`, `0xEFCDAB89`, `0x98BADCFE`, `0x10325476` are the MD5
+initial state. `FUN_1400f44b0` (209 bytes) folds the 4-byte index
+into that state; it does not store through the data pointer. The
+digest is then patched: byte 6 becomes `(byte & 0xF) | 0x30` and
+byte 8 becomes `(byte & 0x3F) | 0x80`. That is a UUID version nibble
+and the RFC variant bits. Nothing increments a process-wide counter.
+
+Two entities from this path differ when the 4-byte input differs.
+The index is `[RBP+0x67]`, and the caller writes it from the match
+it found:
+
+```
+RVA 0xB2292E LEA R8D,[RAX + 0x1]
+RVA 0xB22932 MOVSX EAX,word ptr [RCX + 0x2]
+RVA 0xB22936 CMP EAX,R8D
+RVA 0xB22939 JZ 0x140b22949
+RVA 0xB22973 MOV R13D,dword ptr [RBP + 0x67]
+RVA 0xB2298A LEA R12D,[R13 + 0x1]
+RVA 0xB229B6 MOV dword ptr [RBX + 0x480],R12D
+```
+
+The loop walks a 0x40-stride array at `[RBX+0xD0]`, count
+`[RBX+0xC8]`, and the hit stores its 1-based slot in `[RBP+0x67]`.
+`[entity+0x480]` then receives that slot plus one. Same parent UUID
+and a different slot give a different MD5, so a different key. The
+same slot on the same parent hashes to the same key, which is the
+duplicate `FUN_140901310` rejects. A fresh entity we allocated
+ourselves has no parent and no slot, so this frame does not apply
+to it.
+
+`FUN_140986bc0` cannot be called on the entity we already allocate.
+Its first act is `CALL qword ptr [RAX+0x20]` on `RCX`, then
+`FUN_1402034a0` on that return, and the UUID is written to that new
+pointer. `RCX` in the caller is `R14`, one of three fields of the
+global at RVA `0x8982FB8` (`[+0x78]`, `[+0x80]`, `[+0x88]`, chosen by
+a byte at `[type+0x20]`), not an entity. Not emitted.
+
+The call that writes the key, not emitted:
+
+```
+FUN_14011b2b0(out16, parent_uuid, &index, 4)   ; MD5, version/variant patched
+FUN_140986bc0(factory, &position, &out16)       ; allocates, then
+                                                ; VMOVUPS [entity+0x8], XMM0
+```
+
 `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
-alloc-only and `--link-puppet` stays as shipped.
+alloc-only and `--link-puppet` stays as shipped. No probe.
 
 ## Sources
 
