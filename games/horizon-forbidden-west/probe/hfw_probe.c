@@ -78,6 +78,30 @@
  * [PlayerGame+0x100] is InitializeSRWLock'd by the same constructor
  * before the publish. entity+0xD8 is not written.
  *
+ * --register-entity (opt-in, mode byte 7): one shot, then exit. Same
+ * gate as --alloc-entity (GameModule* at RVA 0x8983150). Same four
+ * ControlledEntity steps (record RVA 0x21DA6C0, size 0x300). The
+ * factory is not called. Parent UUID is the 16 bytes at
+ * [[PlayerGame+0x30]+0x8]. Player is the first entry the sampler
+ * already walks: [[PlayerManager+0x10]], PlayerManager* at RVA
+ * 0x8982C80, entity of that player at [PlayerGame+0x30]. A null
+ * PlayerManager* or a null live entity returns without the call.
+ * Slot is a u32, 0 then 1 then 2. The key is MD5 of the 16 parent
+ * bytes then that dword, little endian, then byte 6
+ * (digest[6] & 0x0F) | 0x30 and byte 8 (digest[8] & 0x3F) | 0x80.
+ * Padding is RFC 1321 (0x80 at RVA 0x11B320, bit length little
+ * endian at 0x11B357 / 0x11B36A). The 16 bytes are stored at
+ * [entity+0x8]. FUN_140986bc0 is not called. Collision is the
+ * compare FUN_140911320 uses: [record+0] and [record+0x8]
+ * (CMP [RBX], R8 / CMP [RBX+0x8], R9 at 0x911477 / 0x911470).
+ * Table is [EntityManagerGame+0x1d8], count at +0x1e4, stride
+ * 0x20. EntityManagerGame* is RVA 0x8982C40. First free slot in
+ * 0..63 wins. All 64 taken returns without the call. Then one
+ * call, inside the same SEH: FUN_140901310(RCX unused, RDX =
+ * entity, R8 = 1, R9 = 0, 5th = 0). R8 = 1 skips [entity+0x68].
+ * entity+0xD8 is not written. FUN_1402250c0, FUN_14134c950,
+ * FUN_1413d8470 and FUN_14101bd70 are not called.
+ *
  * Anchors (image base of the exe, this exact build):
  * 0x8982C80 PlayerManagerGame*
  * 0x8982DD0 SceneManagerGame*
@@ -106,6 +130,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <math.h>
 
 #define RVA_PLAYER_MANAGER 0x8982C80ull
@@ -153,6 +178,24 @@
 #define RVA_SIZE_FROM_RECORD 0x2032D0ull
 #define RVA_PLACE_CONTROLLED 0x11A0980ull
 #define RVA_LINK_PLAYER 0xD73270ull
+
+/* FUN_140901310. R8 = 1 skips the [entity+0x68] read at 0x901426.
+ * R9 = 0 skips the virtual at 0x901416. The 5th stack arg is unused
+ * by the insert. EntityManagerGame* is the global at 0x8982C40.
+ * The hash table FUN_140911320 compares is [em+0x1d8], count at
+ * +0x1e4, stride 0x20. The 16-byte key is [record+0], not
+ * [[record+0x10]+0x8]: CMP [RBX],R8 / CMP [RBX+0x8],R9 at
+ * 0x911477 / 0x911470, and R8/R9 were loaded from the key pointer. */
+#define RVA_ENTITY_MANAGER 0x8982C40ull
+#define RVA_REGISTER_ENTITY 0x901310ull
+#define OFF_EM_TABLE 0x1d8
+#define OFF_EM_OCCUPIED 0x1e0
+#define OFF_EM_COUNT 0x1e4
+#define OFF_HASH_STRIDE 0x20
+#define OFF_PLAYER_LIVE 0x30
+#define OFF_ENTITY_UUID 0x8
+#define REGISTER_SLOT_CAP 64
+#define REGISTER_SCAN_CAP 1048576u
 
 static volatile LONG g_stop = 0;
 static volatile LONG g_faults = 0;
@@ -220,6 +263,8 @@ typedef unsigned long long (__fastcall *alloc_fn)(unsigned long long size);
 typedef unsigned long long (__fastcall *record_fn)(unsigned long long record);
 typedef void (__fastcall *place_fn)(unsigned long long record, unsigned long long block);
 typedef unsigned long long (__fastcall *link_fn)(unsigned long long block, unsigned long long entity);
+typedef void (__fastcall *register_fn)(unsigned long long unused, unsigned long long entity,
+ unsigned long long mode, unsigned long long mode2, unsigned long long fifth);
 
 /* One shot. Four inner steps of FUN_1401f82b0, not the factory.
  * The factory is not called: its RCX is a parent container the probe
@@ -291,6 +336,291 @@ static DWORD WINAPI alloc_entity(LPVOID unused)
  "alloc-entity stop ptr=0x%llX vtable=0x%llX size=0x%X "
  "ctor=0x%llX seh=0x%08X (factory not called, not inserted)\n",
  block, vtable, size, ctor, seh);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+}
+
+/* RFC 1321, as FUN_14011b2b0 finalizes it. 0x80 pad at RVA 0x11B320,
+ * bit length little endian at 0x11B36A / 0x11B363, then one more
+ * FUN_1400f4590. Init is the four constants at 0x11B2D0. */
+static unsigned int md5_rot(unsigned int x, int n)
+{
+ return (x << n) | (x >> (32 - n));
+}
+
+static void md5_rfc1321(const unsigned char *msg, unsigned int len, unsigned char out[16])
+{
+ static const unsigned int T[64] = {
+ 0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu,
+ 0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
+ 0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
+ 0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u,
+ 0xf61e2562u, 0xc040b340u, 0x265e5a51u, 0xe9b6c7aau,
+ 0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
+ 0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu,
+ 0xa9e3e905u, 0xfcefa3f8u, 0x676f02d9u, 0x8d2a4c8au,
+ 0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
+ 0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u,
+ 0x289b7ec6u, 0xeaa127fau, 0xd4ef3085u, 0x04881d05u,
+ 0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
+ 0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u,
+ 0x655b59c3u, 0x8f0ccc92u, 0xffeff47du, 0x85845dd1u,
+ 0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
+ 0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u
+ };
+ static const int S[64] = {
+ 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+ 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+ 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+ 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+ };
+ unsigned char buf[64];
+ unsigned int a0 = 0x67452301u;
+ unsigned int b0 = 0xefcdab89u;
+ unsigned int c0 = 0x98badcfeu;
+ unsigned int d0 = 0x10325476u;
+ unsigned long long bits = (unsigned long long)len * 8ull;
+ unsigned int i, nblocks, padded;
+
+ padded = ((len + 9u + 63u) / 64u) * 64u;
+ nblocks = padded / 64u;
+ for (i = 0; i < nblocks; i++) {
+ unsigned int j, a, b, c, d, f, g, w[16];
+ for (j = 0; j < 64; j++) {
+ unsigned int off = i * 64u + j;
+ if (off < len) buf[j] = msg[off];
+ else if (off == len) buf[j] = 0x80;
+ else if (off >= padded - 8u) {
+ unsigned int sh = (off - (padded - 8u)) * 8u;
+ buf[j] = (unsigned char)(bits >> sh);
+ } else buf[j] = 0;
+ }
+ for (j = 0; j < 16; j++)
+ w[j] = (unsigned int)buf[j * 4]
+ | ((unsigned int)buf[j * 4 + 1] << 8)
+ | ((unsigned int)buf[j * 4 + 2] << 16)
+ | ((unsigned int)buf[j * 4 + 3] << 24);
+ a = a0; b = b0; c = c0; d = d0;
+ for (j = 0; j < 64; j++) {
+ if (j < 16) { f = (b & c) | (~b & d); g = j; }
+ else if (j < 32) { f = (d & b) | (~d & c); g = (5u * j + 1u) & 15u; }
+ else if (j < 48) { f = b ^ c ^ d; g = (3u * j + 5u) & 15u; }
+ else { f = c ^ (b | ~d); g = (7u * j) & 15u; }
+ f = f + a + T[j] + w[g];
+ a = d; d = c; c = b;
+ b = b + md5_rot(f, S[j]);
+ }
+ a0 += a; b0 += b; c0 += c; d0 += d;
+ }
+ for (i = 0; i < 4; i++) {
+ out[i] = (unsigned char)(a0 >> (8 * i));
+ out[4 + i] = (unsigned char)(b0 >> (8 * i));
+ out[8 + i] = (unsigned char)(c0 >> (8 * i));
+ out[12 + i] = (unsigned char)(d0 >> (8 * i));
+ }
+}
+
+/* 16 parent bytes, then the slot dword, little endian. Then the two
+ * patches at 0x11B3A9 / 0x11B3AB / 0x11B3B1 and 0x11B3A5 / 0x11B3AD. */
+static void uuid_from_slot(const unsigned char parent[16], unsigned int slot, unsigned char key[16])
+{
+ unsigned char msg[20];
+ int i;
+ for (i = 0; i < 16; i++) msg[i] = parent[i];
+ msg[16] = (unsigned char)slot;
+ msg[17] = (unsigned char)(slot >> 8);
+ msg[18] = (unsigned char)(slot >> 16);
+ msg[19] = (unsigned char)(slot >> 24);
+ md5_rfc1321(msg, 20, key);
+ key[6] = (unsigned char)((key[6] & 0x0f) | 0x30);
+ key[8] = (unsigned char)((key[8] & 0x3f) | 0x80);
+}
+
+/* Occupied records only. FUN_140911320 treats [record+0x18] == 0 as
+ * empty (0x9114C5) and compares the 16 bytes at [record+0] with the
+ * key, zeros included. */
+static int key_present(unsigned long long table, unsigned int count, const unsigned char key[16])
+{
+ unsigned int i;
+ if (!table || !count) return 0;
+ for (i = 0; i < count; i++) {
+ unsigned char rec[16];
+ unsigned int hash;
+ unsigned long long rec_at = table + (unsigned long long)i * OFF_HASH_STRIDE;
+ hash = rd32(rec_at + 0x18);
+ if (!hash) continue;
+ if (!rd_bytes(rec_at, rec, 16)) return 1;
+ if (memcmp(rec, key, 16) == 0) return 1;
+ }
+ return 0;
+}
+
+/* One shot. Alloc a ControlledEntity, write a free MD5 key at
+ * [entity+0x8], then FUN_140901310 once. FUN_140986bc0 is not called:
+ * it allocates its own entity before the store. */
+static DWORD WINAPI register_entity(LPVOID unused)
+{
+ FILE *fp;
+ int waited = 0;
+ unsigned long long base;
+ unsigned long long module = 0;
+ unsigned long long pm = 0;
+ unsigned long long storage = 0;
+ unsigned long long player = 0;
+ unsigned long long live = 0;
+ unsigned long long em = 0;
+ unsigned long long table = 0;
+ unsigned int count_before = 0;
+ unsigned int count_after = 0;
+ unsigned int occupied_before = 0;
+ unsigned int occupied_after = 0;
+ unsigned int scan_n = 0;
+ unsigned long long record;
+ unsigned long long ctor = 0;
+ unsigned int size = 0;
+ unsigned long long entity = 0;
+ unsigned long long vtable = 0;
+ unsigned int seh = 0;
+ unsigned int slot = 0;
+ int found = 0;
+ unsigned char parent[16];
+ unsigned char key[16];
+ int i;
+ (void)unused;
+
+ SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ fopen_s(&fp, "hfw-probe.log", "w");
+ if (!fp) return 0;
+ setvbuf(fp, NULL, _IONBF, 0);
+
+ fprintf(fp,
+ "register-entity start one-shot gate=GameModule@0x8983150 "
+ "steps=ctor-from-record,size-from-record,alloc,place,md5,register "
+ "record=0x21DA6C0 factory-not-called\n");
+
+ while (!g_stop && waited < SLOT_WAIT_TICKS) {
+ module = rd64(exe_base() + RVA_GAME_MODULE);
+ if (module) break;
+ waited++;
+ Sleep(SLOT_MS);
+ }
+
+ fprintf(fp,
+ "register-entity gate module=0x%llX waited_s=%d faults=%ld\n",
+ module, waited / SLOT_HZ, g_faults);
+
+ if (!module) {
+ fprintf(fp,
+ "register-entity timeout. FUN_140901310 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ base = exe_base();
+ pm = rd64(base + RVA_PLAYER_MANAGER);
+ storage = pm ? rd64(pm + OFF_LIST_STORAGE) : 0;
+ player = storage ? rd64(storage) : 0;
+ live = player ? rd64(player + OFF_PLAYER_LIVE) : 0;
+ fprintf(fp,
+ "register-entity parent pm=0x%llX player=0x%llX live=0x%llX\n",
+ pm, player, live);
+ if (!pm || !live) {
+ fprintf(fp,
+ "register-entity stop no parent. FUN_140901310 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+ if (!rd_bytes(live + OFF_ENTITY_UUID, parent, 16)) {
+ fprintf(fp,
+ "register-entity stop parent read fault. FUN_140901310 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ em = rd64(base + RVA_ENTITY_MANAGER);
+ table = em ? rd64(em + OFF_EM_TABLE) : 0;
+ count_before = em ? rd32(em + OFF_EM_COUNT) : 0;
+ occupied_before = em ? rd32(em + OFF_EM_OCCUPIED) : 0;
+ fprintf(fp,
+ "register-entity table em=0x%llX table=0x%llX "
+ "count_before=%u occupied_before=%u\n",
+ em, table, count_before, occupied_before);
+ if (!em || !table) {
+ fprintf(fp,
+ "register-entity stop no table. FUN_140901310 not called.\n");
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ /* +0x1e4 is the bucket count FUN_140911320 masks with
+ * ([hash+0xc], DEC then AND). +0x1e0 is the occupied count the
+ * insert increments ([hash+0x8] at 0x9114F7). The table is
+ * open-addressed, so a key can sit in any of the buckets. The
+ * scan walks all of them and skips [record+0x18] == 0. */
+ if (!count_before || count_before > REGISTER_SCAN_CAP) {
+ fprintf(fp,
+ "register-entity stop bucket count %u unusable. "
+ "FUN_140901310 not called.\n",
+ count_before);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+ scan_n = count_before;
+
+ for (slot = 0; slot < REGISTER_SLOT_CAP; slot++) {
+ uuid_from_slot(parent, slot, key);
+ if (!key_present(table, scan_n, key)) {
+ found = 1;
+ break;
+ }
+ }
+ if (!found) {
+ fprintf(fp,
+ "register-entity stop all %d slots collide count=%u. "
+ "FUN_140901310 not called.\n",
+ REGISTER_SLOT_CAP, count_before);
+ fflush(fp);
+ fclose(fp);
+ return 0;
+ }
+
+ record = base + RVA_ENTITY_RECORD;
+ __try {
+ record_fn ctor_from = (record_fn)(base + RVA_CTOR_FROM_RECORD);
+ record_fn size_from = (record_fn)(base + RVA_SIZE_FROM_RECORD);
+ alloc_fn alloc = (alloc_fn)(base + RVA_ALLOC);
+ place_fn place = (place_fn)(base + RVA_PLACE_CONTROLLED);
+ register_fn reg = (register_fn)(base + RVA_REGISTER_ENTITY);
+ ctor = ctor_from(record);
+ size = (unsigned int)size_from(record);
+ entity = alloc((unsigned long long)size);
+ if (entity) {
+ place(record, entity);
+ memcpy((void *)(entity + OFF_ENTITY_UUID), key, 16);
+ reg(0, entity, 1, 0, 0);
+ }
+ } __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+ }
+
+ if (entity && !seh) vtable = rd64(entity);
+ count_after = em ? rd32(em + OFF_EM_COUNT) : 0;
+ occupied_after = em ? rd32(em + OFF_EM_OCCUPIED) : 0;
+ fprintf(fp, "register-entity slot=%u key=", slot);
+ for (i = 0; i < 16; i++) fprintf(fp, "%02X", key[i]);
+ fprintf(fp,
+ " entity=0x%llX vtable=0x%llX size=0x%X ctor=0x%llX "
+ "seh=0x%08X count_before=%u count_after=%u "
+ "occupied_before=%u occupied_after=%u "
+ "(FUN_140986bc0 not called, entity+0xD8 not written)\n",
+ entity, vtable, size, ctor, seh, count_before, count_after,
+ occupied_before, occupied_after);
  fflush(fp);
  fclose(fp);
  return 0;
@@ -704,6 +1034,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
  else if (mode == 4) entry = read_cam;
  else if (mode == 5) entry = alloc_entity;
  else if (mode == 6) entry = link_puppet;
+ else if (mode == 7) entry = register_entity;
  thread = CreateThread(NULL, 0, entry, NULL, 0, NULL);
  if (thread) CloseHandle(thread);
  } else if (reason == DLL_PROCESS_DETACH) {

@@ -5184,6 +5184,86 @@ called on the entity we already have. `FUN_1402250c0`,
 `--link-puppet` stays as shipped, `--register-entity` stays
 unemitted. No probe.
 
+### `--register-entity` emitted (2026-10-22)
+
+Offline only. One `-noanalysis -readOnly -process` pass
+(`local/ghidra_scripts/UuidKey9.java`, report `local/uuid9.txt`).
+No re-analysis, no symbol scan, no inject, no launch, nothing
+written under `M:\`. `--register-entity` is mode byte 7.
+
+The call frame, emitted once, inside the same SEH as the other
+one-shot modes:
+
+`FUN_140901310(RCX unused, RDX = the 0x300 ControlledEntity, R8 = 1, R9 = 0, 5th = 0)`.
+
+`R8 = 1` skips the `[entity+0x68]` read. `[entity+0xD8]` is not
+written and is not tested. `FUN_140986bc0` is not called. The 16
+bytes are a plain store at `[entity+0x8]`.
+
+MD5 is standard RFC 1321. Finalization is in `FUN_14011b2b0`, not
+in `FUN_1400f44b0` (that one only appends the 4 slot bytes and adds
+4 to the length). After the append, `0x11B320` stores `0x80` at
+`[buf + (len & 0x3F)]`. The pad count is `0x37 - (len & 0x3F)`, and
+when that goes negative it adds 8 and compresses a full block
+(`CALL 0x1400f4590` at `0x11B33B`) before zeroing 0x38 more bytes.
+The bit length is `LEA RAX,[RCX*8]` / `SHR RCX,0x1d` at `0x11B357`
+/ `0x11B35F`, stored little endian at `[RBP+0x3f]` / `[RBP+0x43]`
+(`0x11B36A` / `0x11B363`), then one more compress at `0x11B36D`.
+That is the `0x80` pad, zeros, and the 64-bit length in bits, little
+endian. Init is still `0x67452301`, `0xEFCDAB89`, `0x98BADCFE`,
+`0x10325476`. The compress those calls reach, `FUN_1400f4590`,
+contains the first MD5 round constant `0xD76AA478` at file offset
+`0xF39E9` (one hit in the exe). The probe uses that padding. It
+does not add a library. Byte 6 and byte 8 are patched after the
+digest, as at `0x11B3A5` through `0x11B3B1`.
+
+The collision scan reads `[record+0]`, the 16 bytes the compare
+loads, not `[[record+0x10]+0x8]`. `FUN_140911320` does:
+
+```
+RVA 0x91145C MOV R8,qword ptr [RBP]
+RVA 0x911460 MOV R9,qword ptr [RBP + 0x8]
+RVA 0x911470 CMP qword ptr [RBX + 0x8],R9
+RVA 0x911477 CMP qword ptr [RBX],R8
+```
+
+`RBP` is the key pointer (`MOV RBP,R9` at `0x91133C`), and the
+caller passed `&[entity+0x8]`. `[RBX]` is the slot. Slots are
+stride `0x20` (`SHL RBX,0x5` at `0x9113A9`). An empty slot is
+`[record+0x18] == 0` (`0x9114C5`). The table is
+`[EntityManagerGame+0x1d8]`. The dword at `+0x1e4` is the bucket count (`MOV EDX,[R15+0xc]` at
+`0x91138E`, then `DEC EDX` and the mask, so the table length is
+that dword). The dword at `+0x1e0` is the occupied count the insert
+increments (`INC dword ptr [R15+0x8]` at `0x9114F7`). The table is
+open-addressed, so a key can sit in any bucket. The probe walks all
+`+0x1e4` buckets and skips a record whose `[record+0x18]` is zero.
+`EntityManagerGame*` is RVA `0x8982C40`. The probe skips a slot
+whose digest matches any occupied record's `[record+0]`. First
+free dword in `0..63`. All 64 taken returns without the call. A
+null `PlayerManager*` or a null live entity (`[PlayerGame+0x30]`
+of `[[PlayerManager+0x10]]`) also returns without the call. The
+log prints both dwords, before and after. The one that should move
+is `+0x1e0`.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and
+`FUN_14101bd70` stay uncalled. `--add-player` stays alloc-only.
+`--link-puppet` stays as shipped.
+
+Run it once. Game open, save loaded, borderless fullscreen. Log is
+`hfw-probe.log` in the game's working directory. From
+`games/horizon-forbidden-west/probe/bin/Release/net10.0` (the
+`net10.0` `OutputPath` the csproj's `TargetFramework` already
+uses):
+
+```
+Start-Process .\hfw-probe.exe -ArgumentList '--exe','M:\Horizon Forbidden West\HorizonForbiddenWest.exe','--register-entity'
+```
+
+The line to look for is `register-entity slot=` with
+`seh=0x00000000`. `count_*` is the dword at `+0x1e4` (capacity).
+`occupied_*` is the dword at `+0x1e0`, and that one should be one
+higher after the call.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)

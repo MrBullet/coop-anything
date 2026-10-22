@@ -83,6 +83,28 @@
 // A hitch is possible while the constructor holds the camera lock;
 // alt-f4 if the game wedges. Start a fresh session and load a save.
 //
+// --register-entity: opt-in. Mode byte 7. One shot, then the thread
+// exits. Same GameModule* gate as --alloc-entity (RVA 0x8983150).
+// Same four ControlledEntity steps (record RVA 0x21DA6C0, size
+// 0x300). FUN_1401f82b0 is not called. The parent UUID is the 16
+// bytes at [[PlayerGame+0x30]+0x8], and that PlayerGame is the first
+// entry the sampler already walks ([[PlayerManager+0x10]],
+// PlayerManager* at RVA 0x8982C80). A null PlayerManager* or a null
+// live entity returns without the call. The key is MD5 of those 16
+// bytes plus a slot dword (0, then 1, then 2), little endian, with
+// byte 6 and byte 8 patched the way FUN_14011b2b0 does. The 16 bytes
+// are stored at [entity+0x8]. FUN_140986bc0 is not called. A slot
+// whose digest is already at [record+0] of [EntityManagerGame+0x1d8]
+// (count at +0x1e4, stride 0x20, EntityManagerGame* at RVA
+// 0x8982C40) is skipped. The first free slot in 0..63 is used. All
+// 64 taken returns without the call. Then, inside the same SEH,
+// FUN_140901310(RCX unused, RDX = entity, R8 = 1, R9 = 0, 5th = 0).
+// R8 = 1 skips [entity+0x68]. entity+0xD8 is not written.
+// FUN_1402250c0, FUN_14134c950, FUN_1413d8470 and FUN_14101bd70 are
+// not called. The line to look for is
+// "register-entity slot=.. key=.. entity=0x.. seh=0x00000000 count_before=.. count_after=..".
+// --add-player stays alloc-only. --link-puppet is unchanged.
+//
 // The second live run (450/450 samples, sane=1, counter climbing, pos
 // frozen) froze because this exe is a console process: opening it steals
 // foreground, and HFW pauses on focus loss. It is a WinExe (WINDOWS
@@ -173,17 +195,20 @@ internal static class Program
  var readCam = HasFlag(args, "--read-cam");
  var allocEntity = HasFlag(args, "--alloc-entity");
  var linkPuppet = HasFlag(args, "--link-puppet");
+ var registerEntity = HasFlag(args, "--register-entity");
  Note(spawnOnce ? "spawn flag seen" : "spawn flag absent");
  Note(readSlot ? "read-slot flag seen" : "read-slot flag absent");
  Note(addPlayer ? "add-player flag seen" : "add-player flag absent");
  Note(readCam ? "read-cam flag seen" : "read-cam flag absent");
  Note(allocEntity ? "alloc-entity flag seen" : "alloc-entity flag absent");
  Note(linkPuppet ? "link-puppet flag seen" : "link-puppet flag absent");
+ Note(registerEntity ? "register-entity flag seen" : "register-entity flag absent");
  var modes = (spawnOnce ? 1 : 0) + (readSlot ? 1 : 0) + (addPlayer ? 1 : 0)
- + (readCam ? 1 : 0) + (allocEntity ? 1 : 0) + (linkPuppet ? 1 : 0);
+ + (readCam ? 1 : 0) + (allocEntity ? 1 : 0) + (linkPuppet ? 1 : 0)
+ + (registerEntity ? 1 : 0);
  if (modes > 1)
  {
- Note("REFUSED: --spawn-once, --read-slot, --add-player, --read-cam, --alloc-entity and --link-puppet are mutually exclusive.");
+ Note("REFUSED: --spawn-once, --read-slot, --add-player, --read-cam, --alloc-entity, --link-puppet and --register-entity are mutually exclusive.");
  return 2;
  }
 
@@ -228,8 +253,8 @@ internal static class Program
  // DLL that only reads [GameModule+0x50]. The mode byte sits next
  // to the DLL, which the game never writes. 0 sampler, 1 spawn-once,
  // 2 read-slot, 3 add-player (one shot), 4 read-cam, 5 alloc-entity,
- // 6 link-puppet (one shot).
- var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : (allocEntity ? 5 : (linkPuppet ? 6 : 0)))));
+ // 6 link-puppet (one shot), 7 register-entity (one shot).
+ var mode = spawnOnce ? 1 : (readSlot ? 2 : (addPlayer ? 3 : (readCam ? 4 : (allocEntity ? 5 : (linkPuppet ? 6 : (registerEntity ? 7 : 0))))));
  var injected = Inject(proc.Id, Path.GetFullPath(dll), mode, out var whyNot);
  if (!injected)
  {
@@ -243,6 +268,7 @@ internal static class Program
  : mode == 4 ? "injected mode=read-cam"
  : mode == 5 ? "injected mode=alloc-entity"
  : mode == 6 ? "injected mode=link-puppet"
+ : mode == 7 ? "injected mode=register-entity"
  : "injected mode=sample");
 
  // HFW pauses when it loses foreground. This process must not become it.
@@ -315,6 +341,21 @@ internal static class Program
  "a visible body is not expected yet.");
  return 0;
  }
+ if (registerEntity)
+ {
+ Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id} mode=register-entity. " +
+ "one shot: the four inner steps, then a free MD5 key stored at [entity+0x8], " +
+ "then FUN_140901310(unused, entity, 1, 0, 0) once, then exit. " +
+ "FUN_140986bc0 is not called. FUN_1402250c0, FUN_14134c950, FUN_1413d8470 " +
+ "and FUN_14101bd70 are not called. entity+0xD8 is not written. " +
+ "log is hfw-probe.log in the game's working directory. " +
+ "start a fresh session, load a save first. " +
+ "the line to look for is 'register-entity slot=' with seh=0x00000000. " +
+ "occupied_after is [EntityManagerGame+0x1e0] and should be one above occupied_before. " +
+ "count_* is the capacity at +0x1e4. " +
+ "a hitch is possible; alt-f4 if wedged.");
+ return 0;
+ }
  Note($"injected {Path.GetFullPath(dll)} into pid {proc.Id}. " +
  "log is hfw-probe.log in the game's working directory. " +
  $"waiting {seconds}s; the dll thread stops on its own.");
@@ -381,7 +422,8 @@ internal static class Program
  // which thread to start. The remote thread is still LoadLibraryW.
  // 0 sampler, 1 spawn-once (blocked), 2 read-slot, 3 add-player, 4 read-cam,
  // 5 alloc-entity (four inner steps, factory not called),
- // 6 link-puppet (four steps, then FUN_140d73270 with the new entity).
+ // 6 link-puppet (four steps, then FUN_140d73270 with the new entity),
+ // 7 register-entity (four steps, MD5 key, then FUN_140901310 once).
  File.WriteAllBytes(dllPath + ".mode", new[] { (byte)mode });
  var wide = Encoding.Unicode.GetBytes(dllPath + "\0");
  var remote = VirtualAllocEx(handle, 0, (nint)wide.Length, MemCommitReserve, PageReadWrite);
