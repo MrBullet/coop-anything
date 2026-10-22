@@ -5264,6 +5264,94 @@ The line to look for is `register-entity slot=` with
 `occupied_*` is the dword at `+0x1e0`, and that one should be one
 higher after the call.
 
+### `--register-entity` faulted after the insert (2026-10-22)
+
+The owner ran it once. The game crashed with an access violation
+after the hash insert. Copied from the owner's log:
+
+```
+register-entity start one-shot gate=GameModule@0x8983150 steps=ctor-from-record,size-from-record,alloc,place,md5,register record=0x21DA6C0 factory-not-called
+register-entity gate module=0x2697F502300 waited_s=0 faults=0
+register-entity parent pm=0x263E02F3170 player=0x269FA0D1900 live=0x26511637280
+register-entity table em=0x264EB7E0000 table=0x26A14140980 count_before=4096 occupied_before=2229
+register-entity slot=0 key=E22883B1002431058EA85780767FB5EB entity=0x264E93F2400 vtable=0x0 size=0x300 ctor=0x7FF7D0670980 seh=0xC0000005 count_before=4096 count_after=4096 occupied_before=2229 occupied_after=2230 (FUN_140986bc0 not called, entity+0xD8 not written)
+```
+
+`seh=0xC0000005`. Occupied went `2229 -> 2230` and the bucket count
+stayed `4096`, so `FUN_140911320` took the empty-slot arm and stored
+the record. The duplicate-key arm at `0x901590` (`0xdeadca7` through
+null at `0x901647`) did not run. The fault is after that store,
+still inside `FUN_140901310`.
+
+`vtable=0x0` is a log-order bug, not a real zero. In
+`register_entity` the vtable read sits after the `__except`:
+
+```
+} __except (EXCEPTION_EXECUTE_HANDLER) {
+ seh = (unsigned int)GetExceptionCode();
+}
+if (entity && !seh) vtable = rd64(entity);
+```
+
+`seh` was `0xC0000005`, so `rd64` never ran and the logged qword is
+the zero it was declared as. The constructor did run:
+`ctor=0x7FF7D0670980` is `FUN_1411a0980` (RVA `0x11A0980`, image base
+`0x7FF7CF4D0000`). It writes the vtable before it returns:
+
+```
+RVA 0x11A0995 LEA RAX,[0x141958958]
+RVA 0x11A099C MOV qword ptr [RBX],RAX
+```
+
+That is `ControlledEntity::vftable`. The call order in the probe is
+alloc, then `place` (`FUN_1411a0980`), then the key store, then
+`FUN_140901310`. A zero vtable would mean the constructor did not
+run. This log does not say that.
+
+The faulting instruction is `CALL qword ptr [RAX]` at RVA
+`0x9015A9`. It is the first instruction after the insert that
+dereferences the entity's vtable. The success path (`[RBP-0x29] == 0`
+is false, so `JNZ 0x140901652` is not taken) is:
+
+```
+RVA 0x901588 MOV R13,qword ptr [RBP + 0x67]
+RVA 0x90158C CMP dword ptr [RBP + -0x29],R14D
+RVA 0x901590 JNZ 0x140901652
+RVA 0x901596 LEA RCX,[0x141795260]
+RVA 0x90159D CALL 0x140042570
+RVA 0x9015A2 MOV RAX,qword ptr [R13]
+RVA 0x9015A6 MOV RCX,R13
+RVA 0x9015A9 CALL qword ptr [RAX]
+```
+
+`[RBP+0x67]` is the saved `RDX` of `FUN_140901310`, the entity
+(`MOV [RSP+0x10], RDX` at `0x90131F`, `LEA RBP,[RSP-0x2f]` at
+`0x90132D`). `R14` is zero. `FUN_140911320` writes `2` to
+`[out+0x10]` on a fresh insert (`0x9114FB`) and `0` when the key is
+already present (`0x91158D`). Occupied increased, so the compare
+falls through. `RAX` is loaded from `[entity+0]`, slot 0 of the
+vtable, and the call dereferences that qword. `RCX` is the entity.
+
+`FUN_140042570` before it is a logging helper (`CALL 0x1416eff2c`,
+`CALL 0x1416f6aec`). It does not touch the entity. Slot 0 of
+`ControlledEntity::vftable` is `FUN_141186f10`, which returns
+`&DAT_1421da6c0`. The crash is the load of the slot, not that
+function. The later entity uses on the same path (`[entity+0x98]`
+at `0x901660`, `[entity+0x160]` at `0x901681`, `LEA R8,[entity+0xD8]`
+at `0x9016E0`) are not reached.
+
+Offline only. Six `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegFault.java` through `RegFault6.java`,
+reports `local/regfault.txt` through `local/regfault6.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. The probe was not changed. The call frame is unchanged.
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and
+`FUN_14101bd70` stay uncalled.
+
+The single next fix: read the vtable before `FUN_140901310` returns
+into the SEH handler, and stop treating the logged zero as the
+constructor's store.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
