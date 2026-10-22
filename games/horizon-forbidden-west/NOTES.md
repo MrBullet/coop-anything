@@ -4308,6 +4308,99 @@ entity. `FUN_14133aa10` is not either: `0xD766C4` passes
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### The slot at `0xD7668C` is `NetReplicatedObjectManager::vftable+0x8` (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0phi.java` through `Slot2f0piu.java`;
+reports `local/pgslot5.txt` through `local/pgslot6m.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. No store writes the entity into a
+manager, so no call frame was emitted.
+
+The call, 25 instructions of it:
+
+```
+RVA 0xD7664C MOV RDI,qword ptr [0x148982d88]
+RVA 0xD7665C LEA RBX,[RDI + 0x30]
+RVA 0xD76660 MOV RCX,RBX
+RVA 0xD76663 CALL qword ptr [0x14174b4a8]
+RVA 0xD76676 MOV RAX,qword ptr [RDI + 0x8]
+RVA 0xD7667A LEA RDX,[RSP + 0x30]
+RVA 0xD7667F XOR R9D,R9D
+RVA 0xD76682 MOV R8B,0xfe
+RVA 0xD76685 MOV RCX,qword ptr [RAX + 0x18]
+RVA 0xD76689 MOV RAX,qword ptr [RCX]
+RVA 0xD7668C CALL qword ptr [RAX + 0x8]
+```
+
+`RCX` is `[[[0x8982D88]+8]+0x18]`. `RDX` is the stack record at
+`[RSP+0x30]`, whose first qword was set to RVA `0x18FB7A0` at
+`0xD76605`. `R8B` is the constant `0xFE`. `R9D` is 0. The `PlayerGame`
+is in `R15` and is not an argument.
+
+The global at RVA `0x8982D88` is zero in the image. The one store
+that fills it with an object is `MOV [0x148982D88], RBX` at
+`0xD65EC6` in `FUN_140d65890`. `RBX` there is the `0xA8` block
+allocated at `0xD65D25` (`EDX = 0xA8`), and the vtable written onto
+it at `0xD65DCA` is `LEA RAX, [0x14198B608]`. The Complete Object
+Locator at that vtable minus 8 (`0x141B10E38`) names
+`.?AVNetEntityManagerGame@@`. So the global is
+`NetEntityManagerGame*`.
+
+`[NetEntityManagerGame+8]` is filled at `0xD65DA6` from
+`[[[0x89581F0]+0xF8]+0xE0]`. The object at `0x89581F0` is the one
+`FUN_140d3d0d0` builds (`MOV [RCX], [0x1418F9C78]` at `0xD3D0E3`),
+and that vtable names `.?AVNetManagerGame@@`. Its `+0xF8` is the
+block `FUN_140d966f0` constructs at `0xD3E8CF` and stores at
+`0xD3E8D7`. That constructor writes `LEA RAX, [0x1418FFD88]` at
+`0xD96736`, and the COL names `.?AVStateInGame@@`. So
+`[NetEntityManagerGame+8]` is `[StateInGame+0xE0]`.
+
+`StateInGame+0xE0` is zero after `FUN_140d966f0`. The store that
+fills it is `MOV [RDI+0xE0], RSI` at `0xD99376` in `FUN_140d98b70`,
+and `RSI` is what `FUN_140411d80` returned at `0xD99363`. That
+constructor writes `LEA RAX, [0x141849CB8]` at `0x411DA4`, COL
+`.?AVNetReplicatedObjectManager@@`. It also stores its own `RDX` at
+`[this+0x18]` (`0x411DA0`), and that `RDX` is
+`[[StateInGame+0xA0]+0x3C58]`. `[StateInGame+0xA0]` is the object
+built at `0xD98D5A` with vtable `0x1988070`, COL
+`.?AVClientIdentityManagerGame@@`.
+
+Slot `+0x8` of `NetReplicatedObjectManager::vftable` (RVA
+`0x1849CB8`) is `FUN_140413df0` (522 bytes, RVA `0x413DF0`). It
+reads a signed word at `[RDX+8]` (`0x413E0C`) and returns unless
+that word is `0xFFFF8065`. The record passed here has the word
+`0x27` (`0xD765F9`), so the call returns at `0x413E2C`. Past that
+gate the only thing it does with a pointer is load `[this+0x10]`,
+which the constructor set to the byte `R8B` (`0x411D8E`), and call
+that object's slot `+0x8` (`0x413F04`) with a stack record whose
+first qword is RVA `0x18499E8`. The body has no `[reg+0x30]` load of
+an entity and no RIP load of `EntityManagerGame*` (`0x8982C40`),
+`SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*` (`0x8982C80`).
+The `0x30` hits are `LEA RCX, [RSP+0x30]`.
+
+Miss. The slot posts a `NetMsgPlayerSpawn` (RVA `0x18FB7A0`, COL
+`.?AVNetMsgPlayerSpawn@@`) into a replicated-object manager. Nothing
+on this path writes the `0x300` entity into a manager, a parent
+pointer, or a model slot.
+
+The single next decompile is `FUN_141211f00`, called at `0xD7681D`.
+`RCX` is `[GameModule+0x1C8]` (`0xD76816`, `RBX` is `GameModule*`
+from `0xD7669D`). `RDX` is the pointer the search at `0xD767F6`
+selected, or zero when nothing matched. `R15` still holds the
+`PlayerGame`, and `[PlayerGame+0x30]` is the entity. The question is
+whether `FUN_141211f00` loads `[PlayerGame+0x30]` and writes the
+entity into `EntityManagerGame*` (`0x8982C40`), `SceneManagerGame*`
+(`0x8982DD0`) or `PlayerManager*` (`0x8982C80`). No call until that
+load is named. `FUN_140916a80` at `0xD767B7` is not the next step: it
+was already walked and returns a player already stored.
+`FUN_140d768d0` at `0xD76847` is not either: its `RCX` is the
+`PlayerGame` and its body loads none of the three managers.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
