@@ -3223,6 +3223,102 @@ is the vtable of the pointer it passes in `RDX`. That vtable's
 slot 0 is the call at `0xA9F981`. No call until that vtable is
 read from the bytes.
 
+### The JMP at `0xAAA4C0` is a message handler, not a vtable slot (2026-10-22)
+
+Offline only. One `-noanalysis -readOnly -process` pass
+(`local/ghidra_scripts/Slot2f0u.java`, report `local/slot2f0u.txt`)
+disassembled the window that the earlier byte scan had left as
+raw bytes, then a second pass (`Slot2f0v.java`,
+`local/slot2f0v.txt`) listed every call of `FUN_1400fe310` whose
+`RCX` is an object `+0x2e8`. No re-analysis, no symbol scan, no
+inject, no launch, nothing written under `M:\`. No new probe mode.
+No call frame was emitted.
+
+The window is a run of five-byte thunks, each padded with `INT3`:
+
+```
+RVA 0xAAA4A0 JMP 0xA9FE00
+RVA 0xAAA4B0 JMP 0xA9FC10
+RVA 0xAAA4C0 JMP 0xA9F910
+RVA 0xAAA4D0 JMP 0xA9F680
+```
+
+`0xAAA4C0` is the thunk. It is not a vtable slot. The qword
+`0x140AAA4C0` sits at RVA `0x2120E68` in a handler table, paired
+with the type-record pointer at `0x2120E60` (`0x142107110`). The
+eight bytes before that qword are the type record, not a Complete
+Object Locator, so the walk-back finds no RTTI and no slot index.
+The same shape repeats for the neighbours:
+
+```
+RVA 0x2120E60 record 0x2107110 MsgEntityAddedToScene handler 0xAAA4C0
+RVA 0x2120E70 record 0x2105640 MsgEntitySpawnCanceled handler 0xAAA4B0
+RVA 0x2120E80 record 0x2101A70 MsgEntityRemovedFromScene handler 0xAAA4A0
+```
+
+So `FUN_140a9f910` is the handler for `MsgEntityAddedToScene`. That
+names the message. It does not name the object stored in the array
+at `+0x2f0`.
+
+Who writes that array. Of 1,383 references to `FUN_1400fe310`, two
+set `RCX` to an object `+0x2e8`, and both were already excluded:
+
+```
+RVA 0x1405F11 ADD RCX,0x2e8 ; in FUN_141405ec0
+RVA 0x1405F18 CALL 0x1400fe310
+```
+
+`FUN_141405ec0` builds a `QuestLocationMarkerWrapper` (vtable
+`0x1990B10`) and `FUN_141408870` builds a
+`QuestSequenceEntityMarkerWrapper` (vtable `0x1990F20`). Each takes
+the owner from `MOV RCX,qword ptr [RDX]`, which is the caller's
+`R15`/`RDI`, and the caller then stores the wrapper into its own
+array at `+0x90` (`MOV EBX,dword ptr [RSI+0x90]` at `0x1405C57`).
+That is not the `Scene` object `FUN_140a9f910` takes as `RCX`.
+
+The only code caller of the `Scene` constructor is
+`FUN_1414c9580` (177 bytes). It is the `MovableScene` constructor:
+after `CALL 0x140a99f10` it writes vtable RVA `0x19A08C0`, whose
+COL names `.?AVMovableScene@@`, and it zeroes fields from `+0x410`
+up. It never mentions `+0x2e8` or `+0x2f0`. Its only code caller,
+`FUN_1414c9640` (188 bytes), overwrites those vtables with RVA
+`0x19A03C0`, whose COL names `.?AVScheduledScene@@`. The 24 slots
+of that vtable inherit `FUN_1402085f0`, and the `FUN_1400fe310`
+inside it (`0x2086BE`) appends onto the vector passed in `RDX`,
+not onto `this+0x2e8`. The one override that stores a pointer,
+`FUN_1414c5680` (225 bytes, slot `+0x40`), writes it to
+`ScheduledScene+0x470` after calling `FUN_140a9a7f0`. Nothing in
+the `Scene`, `MovableScene` or `ScheduledScene` constructors or
+vtables pushes an element into the array `FUN_140a9f910` walks.
+
+Inside the handler the decompiler reads the walk as a forward:
+
+```
+(*(code *)**(undefined8 **)*puVar8)(*puVar8, plVar9, *(int *)(param_2 + 0xc) == 0);
+```
+
+`plVar9` is the entity recovered from `param_2[7] - 0x20`. The
+same function later appends an entity position into the scene's
+own array at `+0x338` (`FUN_1400e7e60` at `0xA9FB..`), which is a
+different field, and it calls `FUN_140aba360` on an object looked
+up in the array at `+0x1f8`. Neither store is the virtual call,
+and neither one loads `EntityManagerGame*` (`0x8982C40`),
+`GameModule*` (`0x8983150`), `SceneManagerGame*` (`0x8982DD0`) or
+`PlayerManager*` (`0x8982C80`).
+
+Miss. The slot-0 target is not named, so it does not insert the
+entity into a manager we hold. No call frame.
+
+The single next decompile is `FUN_141406800`, which
+`FUN_141406690` calls once the quest wrapper has matched the
+entity. The question is whether the 0xA0-byte object it builds
+there is stored into a `Scene`'s `+0x2f0`, and what vtable that
+object gets. No call until that store is shown.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
