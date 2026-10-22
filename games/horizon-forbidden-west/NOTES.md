@@ -3429,6 +3429,79 @@ entity, writes the entity into a manager we already hold.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_141407df0` appends a quest node, not the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0zu.java`, `Slot2f0zv.java`; reports
+`local/slot2f0zu.txt`, `local/slot2f0zv.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. The function does not insert the entity, so no call
+frame was emitted.
+
+The call at `0x14068C2` is inside `FUN_141406800` (264 bytes). The
+two registers are set immediately before it, and both of them were
+filled at the top of that function, not by the block that builds
+the `0xA0` object:
+
+```
+RVA 0x1406823 MOV RSI,RDX
+RVA 0x140682B MOV R14,qword ptr [RCX + 0x18]
+RVA 0x14068BC MOV RDX,RDI
+RVA 0x14068BF MOV RCX,R14
+RVA 0x14068C2 CALL 0x141407df0
+```
+
+`RSI` is the entity, the `RDX` `FUN_141406690` passed in. `R14` is
+`[wrapper+0x18]`, the quest the wrapper was constructed with
+(`FUN_141405ec0` stores `R8` there at `0x1405EE8`). `RDI` is the
+`0xA0`-byte block allocated at `0x140686C` (`MOV EDX,0xa0`, then
+`CALL qword ptr [RAX+0x88]`), or zero when that allocation fails.
+So `RCX` of `FUN_141407df0` is the quest and `RDX` is the `0xA0`
+block. The entity pointer itself is not an argument. It only
+contributes the two qwords copied out of it:
+
+```
+RVA 0x14068AD VMOVUPS XMM0,xmmword ptr [RSI + 0x8]
+RVA 0x14068B2 VMOVUPS xmmword ptr [RDI + 0x4],XMM0
+```
+
+`FUN_141407df0` is 431 bytes. It allocates `0x450` bytes from the
+same allocator (`MOV EDX,0x450` at `0x1407E6E`, virtual call
+`[RAX+0x88]` at `0x1407E73`), stores the `0xA0` block at the new
+object's `+0x8`, and appends that new object onto an array that
+belongs to the quest:
+
+```
+RVA 0x1407E1B MOV RDI,RDX
+RVA 0x1407E8B MOV qword ptr [RSI + 0x8],RDI
+RVA 0x1407F4B MOV qword ptr [RCX + RAX*0x8],RSI
+```
+
+The array pointer is `quest+0x78` and the count is the dword at
+`quest+0x70` (`LEA RDI,[RBP+0x70]` at `0x1407ECA`, the store above
+is the push, then the dword is incremented). `RCX` in that store is
+the grown buffer, and `RSI` is the `0x450` node, not the entity.
+The two later byte stores, `MOV byte ptr [RAX+0x9a],1` at
+`0x1407F88` and `MOV byte ptr [RAX+0xb0],1` at `0x1407F93`, write
+flags through `[quest+0x18]`, not a pointer. Nothing in the
+function writes `child+0x80`, `parent+0x88`, or a model slot, and
+it never loads `EntityManagerGame*` (`0x8982C40`), `GameModule*`
+(`0x8983150`), `SceneManagerGame*` (`0x8982DD0`), `PlayerManager*`
+(`0x8982C80`) or the map global at `0x8983278`.
+
+Miss. The quest receives a refcounted copy of two qwords from the
+entity and keeps it on its own list. It does not write the entity
+into a manager we hold.
+
+The single next decompile is `FUN_1413efb50` (called at `0x1407EBA`
+with `RCX` = the `0x450` node, which holds the `0xA0` block at
+`+0x8`). The question is whether that function writes the entity,
+or the `0xA0` block, into one of the four managers we hold.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
