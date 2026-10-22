@@ -4084,6 +4084,128 @@ value is named.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140916a80` returns a player already in the manager (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pgm.java`, `Slot2f0pgn.java`,
+`Slot2f0pgo.java`; reports `local/pgslot3.txt`,
+`local/pgslot3b.txt`, `local/pgslot3c.txt`). No re-analysis, no
+symbol scan, no inject, no launch, nothing written under `M:\`. No
+new probe mode. No store writes the entity into a manager, so no
+call frame was emitted.
+
+The call at `0xD767B7` is the fast arm of `FUN_140916a80`. The
+window is inside `FUN_140d75d60`, and the two arguments are the
+manager and a static key, not the entity:
+
+```
+RVA 0xD767A9 MOV RCX,qword ptr [0x148982c80]
+RVA 0xD767B0 LEA RDX,[0x1420f76b0]
+RVA 0xD767B7 CALL 0x140916a80
+RVA 0xD767BC MOV RCX,R13
+RVA 0xD767BF TEST RAX,RAX
+RVA 0xD767C2 JZ 0x140d767c8
+RVA 0xD767C4 MOV RCX,qword ptr [RAX + 0x48]
+RVA 0xD767C8 ADD RCX,0xa0
+RVA 0xD767CF LEA RDX,[0x1421ea6d0]
+RVA 0xD767D6 CALL 0x1408fa230
+```
+
+`0xD767A9 + 7 + 0x07C0C4D0 = 0x8982C80`, so `RCX` is
+`PlayerManager*`. `R13` is the zero set at `0xD75D72`, which is why
+the null return falls through with `RCX` still zero and the next
+instruction adds `0xa0` anyway.
+
+`FUN_140916a80` is 168 bytes and returns a `longlong`. The key at
+RVA `0x20F76B0` is three dwords then a null qword: index `3`, flag
+`1`, mode `2`, pointer `0`. That is the fast arm, and the return is
+one load:
+
+```
+RVA 0x916A9A MOVSXD RAX,dword ptr [RDX]
+RVA 0x916A9D MOV RAX,qword ptr [RCX + RAX*0x8 + 0x48]
+RVA 0x916AA2 RET
+```
+
+Index `3` makes the address `PlayerManager + 0x48 + 0x18`, so
+`RAX` is the qword at `PlayerManager+0x60`. The other arm walks
+`[PlayerManager + 0x10 + index*0x10]` and returns the element
+pointer (`MOV RAX,R8` at `0x916B24`) or zero (`XOR EAX,EAX` at
+`0x916B21`). Neither arm allocates, and neither writes. No vtable
+and no RTTI are read on the way out, so the return is not a
+`PlayerGame` created here. It is a slot the manager already holds.
+The body has no `[reg+0x30]` and no RIP load of `EntityManagerGame*`
+(`0x8982C40`), `SceneManagerGame*` (`0x8982DD0`), `PlayerManager*`
+(`0x8982C80`) or `GameModule*` (`0x8983150`).
+
+`[RAX+0x48]` is not a `PlayerGame` either. `0xD767C4` loads it into
+`RCX` and `0xD767C8` adds `0xa0` before calling `FUN_1408fa230`.
+That function is the same component-map search already named: it
+binary-searches the map at `object+0xa0`. The key at `0x21EA6D0`
+starts with `dword0 = 0xFFFFFFFF`, which is a type id, not an
+entity. The hit is a dword at `[result+0x68]` (`0xD767DB`), compared
+against a range table (`0xD767F6`, `0xD767FB`). On a hit the code at
+`0xD7688F` picks one pointer out of `[record+0x10]` and jumps back
+to `0xD76811`:
+
+```
+RVA 0xD768B5 MOV RAX,qword ptr [R9 + 0x10]
+RVA 0xD768BC MOV RDX,qword ptr [RAX + RCX*0x8]
+RVA 0xD768C0 JMP 0x140d76811
+```
+
+`0xD76811` tests that pointer and, when it is non-zero, calls
+`FUN_141211f00` with `RCX = [RBX+0x1c8]`. `FUN_140d768d0`, reached
+later with `RCX = R15` (the `PlayerGame` saved at `0xD75D79`), was
+already checked: no `[reg+0x30]` load and no load of the three
+managers. Nothing from `0xD767B7` through `0xD768C0` stores
+`[return+0x48]`, `[that+0x30]`, or the `0x300` entity into
+`PlayerManager`, `EntityManagerGame`, `SceneManagerGame`, a parent
+pointer, or a model slot.
+
+Miss. The lookup reads a player the manager already has and then
+reads a component map off `[that+0x48]`. It does not register the
+allocated entity. `FUN_140d8c2d0` is not the next step: it is the
+insert already excluded. Its entry is `MOV RSI,RCX` / `MOV RBX,RDX`
+(`0xD8C2D8`, `0xD8C2E4`), the first push is `FUN_1402250c0` of that
+`RDX` (`0xD8C2FF`), and the body has no RIP load of `PlayerManager*`,
+`EntityManagerGame*` or `SceneManagerGame*`. `RDX` is the
+`PlayerGame`, not the `0x300` entity.
+
+`FUN_140916bf0` (35 bytes), the other caller of this lookup, returns
+`[player+0x48]` and nothing else. `FUN_141211f00`, reached from the
+match arm, was already walked: `[RBP+0x30]` is a count on its own
+argument and it loads none of the three managers.
+
+The `PlayerGame` this function does hold (`R15`, from `MOV R15,RCX`
+at `0xD75D79`) is stored once, and not into a manager:
+
+```
+RVA 0xD7646C MOV qword ptr [RBX + 0xe8],R15
+RVA 0xD76473 MOV dword ptr [RBX + 0x94],0x1
+RVA 0xD7647D CALL 0x140a325e0
+```
+
+`FUN_140a325e0` (318 bytes) saves `RDX` and never reads it. It loads
+neither `[reg+0x30]`, `[reg+0xe8]`, nor any of the three manager
+globals. The `0x300` entity is not in `R15`.
+
+The single next decompile is `FUN_1401e5b60` (98 bytes, RVA
+`0x1E5B60`). It is the function the virtual at `0xD76452` enters:
+`RCX` is the TLS record or the static object at RVA `0x1FE1F00`
+(vtable RVA `0x17B3148`), and `RDX` is `R12`. The body only walks
+that pointer's header and tails into another slot `+0x98`
+(`JMP qword ptr [RAX+0x98]` at `0x1E5B99` and `0x1E5BBB`). It loads
+none of the three managers. The question is whether the function
+that tail returns is given the `0x300` entity, and whether it
+writes that entity into `PlayerManager*` (`0x8982C80`),
+`EntityManagerGame*` (`0x8982C40`) or `SceneManagerGame*`
+(`0x8982DD0`). No call until that return is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
