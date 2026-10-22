@@ -4401,6 +4401,138 @@ was already walked and returns a player already stored.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_141211e00` clears a vector, it does not take the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0piw.java` through `Slot2f0pjd.java`;
+reports `local/pgslot7.txt` through `local/pgslot7h.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. No store writes the entity into a
+manager, so no call frame was emitted.
+
+`FUN_141211e00` is 237 bytes. `RCX` is `[GameModule+0x1C8]`, saved
+to `RSI` at `0x1211E0A`. `RDX`, the search hit, is never read. The
+body walks the counted pointer array that object already holds and
+then frees the array:
+
+```
+RVA 0x1211E06 MOVSXD RAX,dword ptr [RCX + 0x10]
+RVA 0x1211E0A MOV RSI,RCX
+RVA 0x1211E17 MOV RDI,qword ptr [RCX + 0x18]
+RVA 0x1211E1B LEA RBP,[RDI + RAX*0x8]
+RVA 0x1211E30 MOV RCX,qword ptr [0x148982a88]
+RVA 0x1211E3A MOV RBX,qword ptr [RDI]
+RVA 0x1211E3D MOV RDX,RBX
+RVA 0x1211E43 CALL qword ptr [RAX + 0x40]
+RVA 0x1211E53 CALL qword ptr [RAX + 0x38]
+RVA 0x1211E56 ADD RDI,0x8
+RVA 0x1211E64 MOV RDX,qword ptr [RSI + 0x18]
+RVA 0x1211ECF CALL qword ptr [RAX + 0x98]
+RVA 0x1211ED7 LEA RCX,[RSI + 0x8]
+RVA 0x1211EDB MOV qword ptr [RSI + 0x18],RAX
+RVA 0x1211EDF MOV qword ptr [RSI + 0x10],RAX
+RVA 0x1211EE8 JMP 0x1406aecf0
+```
+
+`0x148982A88` is the same global the caller uses at `0x1211F1F`.
+The slot `+0x98` at `0x1211ECF` is the `AssetMemoryPool` free
+already named (`FUN_1401e5b60`), and `RDX` there is
+`[[GameModule+0x1C8]+0x18]`, the array pointer, not the entity.
+The tail at `0x1211EE8` is `FUN_1406aecf0` (131 bytes) with `RCX` =
+`[GameModule+0x1C8]+0x8`. It calls that object's slots `+0x40` and
+`+0x28` and then masks `[first+0x8]`. Its two `+0x30` hits are the
+saved `RDI` (`MOV qword ptr [RSP+0x30],RDI` at `0x6AED15`). It
+loads none of the three manager globals.
+
+The two stores are both inside the object the function was given:
+
+```
+RVA 0x1211EDB MOV qword ptr [RSI + 0x18],RAX
+RVA 0x1211EDF MOV qword ptr [RSI + 0x10],RAX
+```
+
+`RAX` is zero (`XOR EAX,EAX` at `0x1211ED5`). So the function
+zeroes the count and the data pointer of `[GameModule+0x1C8]`.
+There is no store of the `0x300` entity into `EntityManagerGame`,
+`SceneManagerGame`, `PlayerManager`, a parent pointer, or a model
+slot. There is no load of `[PlayerGame+0x30]`.
+
+`FUN_140d75d60` does not hide that load after the call either. The
+function is 2917 bytes and uses `R15` 26 times. `R15` is the
+`PlayerGame` (`MOV R15,RCX` at `0xD75D79`). None of those 26 is
+`[R15+0x30]`. After `0xD7681D` there are three calls, and the
+function returns at `0xD7688E`:
+
+```
+RVA 0xD76844 MOV RCX,R15
+RVA 0xD76847 CALL 0x140d768d0
+RVA 0xD7685E MOV RCX,qword ptr [R15 + 0x1d8]
+RVA 0xD7686A CALL 0x1402084c0
+RVA 0xD7686F LEA RCX,[RSP + 0x130]
+RVA 0xD7687E CALL 0x140107850
+RVA 0xD7688E RET
+```
+
+`FUN_140d768d0` was already walked: no `[reg+0x30]` of the entity
+and no load of the three managers. `FUN_1402084c0` (87 bytes) and
+`FUN_140107850` (189 bytes) have no such load either. The `+0x1d8`
+pointer is not the entity.
+
+The one place this function does hold `EntityManagerGame*` together
+with the `PlayerGame` is earlier, and it does not load the entity
+either. `FUN_1409145c0` (508 bytes) is called at `0xD75DDA` with
+`RCX` = `R15`:
+
+```
+RVA 0xD75DD3 MOV RCX,R15
+RVA 0xD75DDA CALL 0x1409145c0
+```
+
+```
+RVA 0x9145E9 MOV RDI,qword ptr [0x148982c40]
+RVA 0x91478A MOV RCX,qword ptr [R14 + 0x48]
+RVA 0x9147A7 MOV RDX,qword ptr [R14 + 0x60]
+RVA 0x9147AB CALL 0x140950ba0
+```
+
+The bytes at `0x9145E9` are `48 8B 3D 50 E6 06 08`, and
+`0x9145E9 + 7 + 0x0806E650 = 0x8982C40`, so `RDI` is
+`EntityManagerGame*`. `R14` is the `PlayerGame`. The call passes
+`[PlayerGame+0x48]` and `[PlayerGame+0x60]`, not
+`[PlayerGame+0x30]`. `FUN_140950ba0` (129 bytes) forwards those two
+to `FUN_14094a6f0` at `0x950BFE`, and that function (166 bytes)
+writes one field:
+
+```
+RVA 0x94A6F6 MOV RAX,qword ptr [RCX + 0x188]
+RVA 0x94A700 CMP RAX,RDX
+RVA 0x94A709 MOV qword ptr [RCX + 0x188],RDX
+```
+
+`RCX` is `[PlayerGame+0x48]` and `RDX` is `[PlayerGame+0x60]`. The
+store is `[[PlayerGame+0x48]+0x188] = [PlayerGame+0x60]`. Neither
+register is the `0x300` entity, and neither function loads
+`[reg+0x30]` of it. `[PlayerGame+0x48]` is the object
+`FUN_140916bf0` returns, already named, not the entity at `+0x30`.
+
+Miss. `FUN_141211e00` drops the vector at `[GameModule+0x1C8]` and
+never sees the entity.
+
+The single next decompile is `FUN_1409145c0`'s use of the manager
+it already holds. `RDI` is `EntityManagerGame*` from `0x9145E9`,
+and the body indexes `[RDI+0x1d8]` (`0x914648`) and
+`[RDI+0x1e4]` (`0x91463A`) but never reads `[PlayerGame+0x30]`.
+The question is whether any element of `[EntityManagerGame+0x1d8]`
+is the `0x300` entity, and whether the call at `0x9147AB` is the
+only write that array receives. No call until that element is
+named. `FUN_140d72230` at `0xD76545` is not the next step: it was
+already walked and its `+0x30` is a saved `RBP`. `FUN_140d768d0`
+at `0xD76847` is not either.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
