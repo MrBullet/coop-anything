@@ -3698,6 +3698,123 @@ bytes, `PlayerGame::vftable+0x28`). The question is what `RDX` is at
 `PlayerManager`, or only reads it. No call until that register and
 that store are named.
 
+### `FUN_140d73c90` reads the entity and never stores it (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0zzk.java` through `Slot2f0zzu.java`;
+reports `local/slot2f0zzk.txt` through `local/slot2f0zzu.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. No store writes the entity into a
+manager, so no call frame was emitted.
+
+`FUN_140d73c90` is 3939 bytes. `RCX` is the `PlayerGame`. It is saved
+to `R13` at entry and stays there until `0xD7438C`, which is after
+every use of it as `this`:
+
+```
+RVA 0xD73C90 MOV qword ptr [RSP + 0x8],RCX
+RVA 0xD73CB2 MOV RSI,RDX
+RVA 0xD73CC4 MOV RDI,R8
+RVA 0xD73CD7 MOV R13,RCX
+```
+
+`RDX` is not the entity. `RSI` is only ever read as a vector
+(`VSUBSD XMM1,XMM0,qword ptr [RSI+0x30]` at `0xD741F3`,
+`VMOVSD XMM7,qword ptr [RSI+0x30]` at `0xD74275`). The entity is
+loaded from the `PlayerGame` later, inside the one callee that
+reads `[PlayerGame+0x30]`.
+
+The `GameModule` load at `0xD748B1` only reads that pointer. The
+instruction is `48 8B 05 98 E8 C0 07`, and
+`0xD748B1 + 7 + 0x07C0E898 = 0x8983150`. What follows takes
+`[GameModule+0x50]` as a stack argument and the `PlayerGame` as
+`this`:
+
+```
+RVA 0xD74823 LEA RDI,[R13 + 0x1e8]
+RVA 0xD748B1 MOV RAX,qword ptr [0x148983150]
+RVA 0xD748B8 MOV RDX,qword ptr [RDI]
+RVA 0xD748BB MOV R9,qword ptr [R13 + 0x60]
+RVA 0xD748C8 MOV R10,qword ptr [RAX + 0x50]
+RVA 0xD748F2 MOV qword ptr [RSP + 0x28],R10
+RVA 0xD74900 MOV RCX,R13
+RVA 0xD7490E CALL 0x140d72230
+```
+
+`RDI` is `PlayerGame+0x1e8`, so `RDX` of the call is
+`[PlayerGame+0x1e8]`, not the entity. `FUN_140d72230` (458 bytes)
+saves that `RCX` to `R14` (`MOV R14,RCX` at `0xD72251`) and stores
+the `PlayerGame` itself:
+
+```
+RVA 0xD7233C MOV qword ptr [RAX + 0xe8],R14
+```
+
+`RAX` there is a block the function just allocated (`LEA ECX,[R15+0x10]`
+at `0xD72268`, `CALL 0x1401e6100` at `0xD7226C`). The one `+0x30` in
+this callee is the epilogue, `LEA R11,[RSP+0x50]` at `0xD723DD` then
+`MOV RBP,qword ptr [R11+0x30]` at `0xD723E9`, which reloads the saved
+`RBP`. It loads none of `EntityManagerGame*` (`0x8982C40`),
+`SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*` (`0x8982C80`).
+
+The entity is read once, in `FUN_140d73960` (742 bytes), which
+`FUN_140d73c90` calls with the `PlayerGame` in `RCX`:
+
+```
+RVA 0xD73D66 MOV RCX,R13
+RVA 0xD73D71 CALL 0x140d73960
+```
+
+```
+RVA 0xD73B13 MOV RCX,qword ptr [RDI + 0x30]
+RVA 0xD73B17 MOV RBP,qword ptr [RCX + 0x48]
+RVA 0xD73B24 MOV RCX,qword ptr [0x1489581d0]
+```
+
+`RDI` is the `PlayerGame` (`MOV RDI,RCX` at `0xD7396D`). The next
+instruction overwrites `RCX`, so the entity pointer is not in a
+register again and is never stored. `RBP` is `[entity+0x48]`, and
+that is what the function writes, into a block it allocates itself:
+
+```
+RVA 0xD73BDA LEA RAX,[0x141948960]
+RVA 0xD73BE5 MOV qword ptr [RBX],RAX
+RVA 0xD73BF8 MOV qword ptr [RBX + 0x30],RBP
+RVA 0xD73C10 MOV qword ptr [RSI],RBX
+RVA 0xD73C34 MOV qword ptr [RDI + 0x208],RSI
+```
+
+The Complete Object Locator before vtable RVA `0x1948960` is VA
+`0x141AD7980` (signature `1`, type-descriptor offset `0x22A5E00`),
+and the descriptor reads `.?AVHunterAbilityDeckManager@@`. The slot
+written at `0x89581D0` is zero in the image, so that load is a
+runtime object, not a second manager. The new object is then stored
+at `[PlayerGame+0x208]`. The first 24 slots of its vtable reference
+none of the four manager globals.
+
+No other instruction in `FUN_140d73c90` loads `[PlayerGame+0x30]`.
+The six `+0x30` operands in the function itself are the vector reads
+on `RSI` and `RDI` (`0xD741F3`, `0xD741F8`, `0xD74275`),
+`[RAX+0x30]` at `0xD74671`, `[R15+0x30]` at `0xD74AB1` (and `R15`
+came from `[RAX+0x80]` at `0xD74A84`, not from the `PlayerGame`),
+and the virtual call `CALL qword ptr [RAX+0x30]` at `0xD74B61`.
+That slot is `FUN_140d74c00` (39 bytes), which zeroes
+`[PlayerGame+0x1e8]` and releases it. It does not touch `+0x30`.
+
+Miss. `FUN_140d73c90` reads `GameModule*` and reads the entity. It
+does not write the entity into `EntityManagerGame`,
+`SceneManagerGame`, `PlayerManager`, or a counted world list.
+
+The single next decompile is `FUN_1410ce420` (`0x10CE420`, 918
+bytes), called at `0xD73C16` with `RCX` = the new
+`HunterAbilityDeckManager` and `RDX` = the object loaded from
+`[0x1489581D0]`. It reads `[RCX+0x30]` at `0x10CE5C4`, which is
+`[entity+0x48]` as stored at `0xD73BF8`, and it calls
+`FUN_1410cd880` (`0x10CE5AB`) and `FUN_1410cdbb0` (`0x10CE77D`).
+The question is whether any of those three stores the entity, or
+`[entity+0x48]`, into `EntityManagerGame`, `SceneManagerGame` or
+`PlayerManager`. No call until that store is shown.
+
 `FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
