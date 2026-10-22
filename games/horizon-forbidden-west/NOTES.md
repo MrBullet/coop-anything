@@ -4839,6 +4839,87 @@ at `0x901596` (`0xdeadca7` at `0x901647`).
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `--register-entity` not emitted: a zero UUID is inserted, and the live key is fatal (2026-10-22)
+
+Offline only. Two `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pjp.java`, `Slot2f0pjq.java`,
+`Slot2f0pjr.java`; reports `local/pgslot9b.txt` through
+`local/pgslot9d.txt`). No re-analysis, no symbol scan, no inject, no
+launch, nothing written under `M:\`. `--register-entity` was not
+added. The probe sources are unchanged.
+
+The call frame from the previous section is still the one that would
+be emitted, and it was not:
+
+`FUN_140901310(RCX unused, RDX = the 0x300 ControlledEntity, R8 = 1, R9 = 0, [RSP+0x20] = 0)`.
+
+`R8 = 1` skips the `[entity+0x68]` read. The `VMOVUPS` at `0x901358`
+copies `[entity+0xD8]` into `[entity+0x118]` and does not test it.
+The insert is `FUN_140911320` at `0x901583` with
+`RCX = &[EntityManagerGame+0x1d8]`. `EntityManagerGame*` is the
+global at RVA `0x8982C40`. The store at `0x9114ED` / `0x9114F0` is
+`MOV RCX,[RAX]` / `MOV [RBX+0x10],RCX`, and `RAX` is
+`LEA RAX,[RBP+0x67]` at `0x901557`, the saved `RDX` slot, so the
+qword written is the entity.
+
+A freshly constructed `ControlledEntity` has `[entity+0x8]` and
+`[entity+0x10]` zero. That pair is not rejected. `FUN_140901310`
+hashes it with no test:
+
+```
+RVA 0x90154E LEA R9,[RBX + 0x8]
+RVA 0x901568 CRC32 R8,qword ptr [R9]
+RVA 0x901578 CRC32 R8,qword ptr [R9 + 0x8]
+RVA 0x901583 CALL 0x140911320
+```
+
+`FUN_140911320` then compares the whole 16-byte key, zeros included,
+against an occupied slot (`CMP [RBX+0x8], R9` / `CMP [RBX], R8` at
+`0x911470` / `0x911477`, and the same pair at `0x911537` / `0x911542`).
+An empty slot is `[record+0x18] == 0` (`0x9114C5`), which falls
+through to the write at `0x9114D8`. A zero key with the high bit set
+on the hash is a normal occupied record. It is inserted.
+
+The same key a second time is not a quiet miss. After the call,
+`FUN_140901310` reads the iterator status the insert wrote. The
+bytes after the call are `4C 8B 6D 67 44 39 75 D7`:
+
+```
+RVA 0x901583 CALL 0x140911320
+RVA 0x901588 MOV R13,qword ptr [RBP + 0x67]
+RVA 0x90158C CMP dword ptr [RBP + -0x29],R14D
+RVA 0x901590 JNZ 0x140901652
+```
+
+`R14` is zero. `[RBP-0x29]` is the dword the insert stores at
+`[out+0x10]` (`MOV dword ptr [R14+0x10], 0` at `0x91158D` when the
+key is already present, `2` at `0x9114FB` when it inserts). The
+taken arm of that compare reaches:
+
+```
+RVA 0x901647 MOV dword ptr [0x0],0xdeadca7
+```
+
+The decompiler prints that arm as
+`Entity could not be added to the EntityManager because an Entity with the same UUID is already in the EntityManager`.
+The hash uses `[entity+0x8]` and `[entity+0x10]` as an identity that
+must be unique. Copying the two qwords from the live player's entity
+(`[PlayerGame+0x30]` of the one player already in `PlayerManager`)
+would be that duplicate, so it was not copied and no UUID was
+invented.
+
+`FUN_140949060` (3511 bytes) is the call immediately before
+`FUN_140901310` in `FUN_140b22790` (`CALL 0x140949060` at `0xB22A32`,
+then `MOV RDX,RBX` / `LEA R8D,[R15+0x1]` / `CALL 0x140901310` at
+`0xB22A3D` / `0xB22A45` / `0xB22A49`). Its first 80 instructions do
+not store `[RCX+0x8]`. That is the next decompile: whether
+`FUN_140949060` writes `[entity+0x8]` and `[entity+0x10]`, and from
+which argument.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
