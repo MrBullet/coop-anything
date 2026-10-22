@@ -4533,6 +4533,173 @@ at `0xD76847` is not either.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `[EntityManagerGame+0x1d8]` is a 0x20 hash slot, not the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0pjf.java` through `Slot2f0pjl.java`;
+reports `local/pgslot8.txt` through `local/pgslot8g.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. The function only reads the array,
+so no call frame was emitted.
+
+The call at `0xD75DDA` is one argument. Twenty instructions before it
+compute a pointer into `RDX`, store it at `[PlayerGame+0x68]`, and
+then pass the `PlayerGame` in `RCX`:
+
+```
+RVA 0xD75DAA MOV RDX,qword ptr [RBX + 0x40]
+RVA 0xD75DB3 MOV RAX,qword ptr [RBX + 0x28]
+RVA 0xD75DB7 MOV RDX,qword ptr [RAX + 0x28]
+RVA 0xD75DBB MOV RAX,qword ptr [0x148982fe8]
+RVA 0xD75DC2 MOV RCX,qword ptr [RAX + 0x68]
+RVA 0xD75DC6 MOV RAX,qword ptr [RCX + 0x88]
+RVA 0xD75DCD CMP qword ptr [R15 + 0x60],RAX
+RVA 0xD75DD1 JNZ 0x140d75ddf
+RVA 0xD75DD3 MOV RCX,R15
+RVA 0xD75DD6 MOV qword ptr [R15 + 0x68],RDX
+RVA 0xD75DDA CALL 0x1409145c0
+```
+
+`R15` is the `PlayerGame` (`MOV R15,RCX` at `0xD75D79`). The call is
+taken only when `[PlayerGame+0x60]` equals `[[0x8982FE8]+0x68]+0x88`.
+`RDX` is not an argument of `FUN_1409145c0`.
+
+`FUN_1409145c0` is 508 bytes and returns void. It takes the
+`PlayerGame` and, when `[PlayerGame+0x68]` differs from
+`[PlayerGame+0x60]`, copies `+0x68` over `+0x60` and then walks the
+manager:
+
+```
+RVA 0x9145C7 PUSH R14
+RVA 0x9145CD MOV RAX,qword ptr [RCX + 0x68]
+RVA 0x9145D1 MOV R14,RCX
+RVA 0x9145D4 MOV RDX,qword ptr [RCX + 0x60]
+RVA 0x9145D8 CMP RAX,RDX
+RVA 0x9145DB JZ 0x1409147b5
+RVA 0x9145E5 MOV qword ptr [RCX + 0x60],RAX
+RVA 0x9145E9 MOV RDI,qword ptr [0x148982c40]
+```
+
+The bytes at `0x9145E9` are `48 8B 3D 50 E6 06 08`.
+`0x9145E9 + 7 + 0x0806E650 = 0x8982C40`, so `RDI` is
+`EntityManagerGame*`. The array is a hash table of `0x20`-byte
+records, not a pointer vector of entities. Count is the dword at
+`+0x1e4`, data is the qword at `+0x1d8`, stride is `0x20`. The lock
+is the `SRWLOCK` at `+0x1e8`:
+
+```
+RVA 0x91460D LEA R12,[RDI + 0x1e8]
+RVA 0x91463A MOVSXD R15,dword ptr [RDI + 0x1e4]
+RVA 0x914648 MOV RAX,qword ptr [RDI + 0x1d8]
+RVA 0x914651 CMP dword ptr [RAX + 0x18],0x0
+RVA 0x91465C ADD RAX,0x20
+RVA 0x914691 MOV RAX,qword ptr [RDI + 0x1d8]
+RVA 0x914698 MOVSXD RCX,EBX
+RVA 0x91469B SHL RCX,0x5
+RVA 0x91469F MOV RSI,qword ptr [RCX + RAX*0x1 + 0x10]
+```
+
+A record is 32 bytes. The occupied test is the dword at
+`[record+0x18]`. The pointer the walk uses is `[record+0x10]`, and
+that pointer is not the `0x300` entity. The body treats it as an
+object that already owns the entity lock and the listener list:
+
+```
+RVA 0x9146A4 MOV RBP,qword ptr [RSI + 0x70]
+RVA 0x914708 LEA RDX,[RSI + 0x298]
+RVA 0x914712 LEA RCX,[RSI + 0x2c0]
+RVA 0x91471E CALL 0x14097fbe0
+```
+
+`+0x298` and `+0x2c0` are the lock and the listener list already
+named on a live entity. `RSI` is that entity. The record only holds
+a pointer to it. The function never reads `[PlayerGame+0x30]`.
+
+It also never writes a record. The only store of a pointer is
+`[PlayerGame+0x60] = [PlayerGame+0x68]` at `0x9145E5`. The walk
+compares `[record+0x18]` and reads `[record+0x10]`; it does not
+store either. The tail call at `0x9147AB` is the one already walked:
+`FUN_140950ba0` writes `[[PlayerGame+0x48]+0x188]`, not this array.
+
+The writer of an element is `FUN_140911320` (634 bytes), called from
+`FUN_140901310` at `0x901583` with `RCX = [EntityManagerGame+0x1d8]`.
+A new table is `0x40` bytes (`CALL 0x1401e6100` at `0x91134F`, stored
+at `0x911358`), and a full record is written as four fields. The
+bytes at `0x9114DD` are `48 8B 44 24 60`:
+
+```
+RVA 0x9114D8 VMOVUPS XMM0,xmmword ptr [RBP]
+RVA 0x9114E2 VMOVUPS xmmword ptr [RBX],XMM0
+RVA 0x9114DD MOV RAX,qword ptr [RSP + 0x60]
+RVA 0x9114F0 MOV qword ptr [RBX + 0x10],RCX
+RVA 0x9114F4 MOV dword ptr [RBX + 0x18],ESI
+RVA 0x9114F7 INC dword ptr [R15 + 0x8]
+```
+
+`[record+0]` and `[record+8]` are the two-qword hash key copied from
+`R9`. The dword at `[record+0x18]` is the hash. The pointer at
+`[record+0x10]` is `*param_5`, the fifth argument, read through
+`[RSP+0x60]`. `FUN_140911320` pushes three registers and subtracts
+`0x20`, so that slot is the caller's `[RSP+0x20]`. At the call in
+`FUN_140901310` the fifth argument is the entity:
+
+```
+RVA 0x90131F MOV qword ptr [RSP + 0x10],RDX
+RVA 0x901324 PUSH RBP
+RVA 0x90132D LEA RBP,[RSP + -0x2f]
+RVA 0x901339 MOV R15,qword ptr [0x148982c40]
+RVA 0x901346 MOV RSI,RDX
+RVA 0x901349 OR.LOCK dword ptr [RDX + 0x98],0x10000000
+RVA 0x901354 MOV RAX,qword ptr [RBP + 0x67]
+RVA 0x901358 VMOVUPS XMM0,xmmword ptr [RAX + 0xd8]
+RVA 0x9013AF MOV RBX,qword ptr [RBP + 0x67]
+RVA 0x90149E LEA RCX,[R15 + 0xb0]
+RVA 0x9014A5 MOV RDX,RBX
+RVA 0x9014A8 CALL 0x140ad3b10
+RVA 0x90154E LEA R9,[RBX + 0x8]
+RVA 0x901557 LEA RAX,[RBP + 0x67]
+RVA 0x901563 MOV qword ptr [RSP + 0x20],RAX
+RVA 0x901571 LEA RCX,[R15 + 0x1d8]
+RVA 0x901583 CALL 0x140911320
+```
+
+`RDX` of `FUN_140901310` is saved at `[RSP+0x10]` before `PUSH RBP`.
+After that push, `LEA RBP, [RSP-0x2f]` makes `[RBP+0x67]` the same
+slot: `-0x2f + 0x67 = 0x38`, and the push moved the saved `RDX` from
+`[RSP+0x10]` to `[RSP+0x18]`, which is `[RBP+0x67]`. The bytes are
+`48 89 54 24 10` at `0x90131F` and `48 8D 6C 24 D1` at `0x90132D`.
+The load at `0x901354` then copies `[RDX+0xD8]` and `[RDX+0xF0]`,
+and `0x901349` sets a bit in `[RDX+0x98]`. `RDX` is the entity. The
+store `FUN_140911320` makes is `[record+0x10] =` the address of that
+saved slot, and the qword there is the entity. The same entity is
+also passed to `FUN_140ad3b10` at `0x9014A8` with
+`RCX = [EntityManagerGame+0xB0]`, a different container.
+
+`FUN_140e97160` (1910 bytes) also writes `[EntityManagerGame+0x1d8]`,
+but it writes the data pointer, not an element. `R12` is zeroed at
+`0xE97176` and again at `0xE97736` and `0xE977DF`, and the store is
+`MOV qword ptr [RBX+0x1d8], R12` at `0xE978C3` after the old buffer
+is freed. It clears the table.
+
+Miss. An element of `[EntityManagerGame+0x1d8]` is a `0x20` hash
+record, not the entity. `[record+0x10]` points at a qword that holds
+the entity, and `FUN_1409145c0` only reads that qword. It does not
+write one.
+
+The single next decompile is `FUN_140901310`. It is the function
+that writes the record, and its `RDX` is the entity whose `+0xD8`
+and `+0xF0` it copies before the insert. The question is whether
+`RDX` is the `0x300` `ControlledEntity`, which means the copy at
+`0x901358` is the entity's own `+0xD8`. One caller to name it from
+is `FUN_14099f9b0` at `0x99FDB4`: `RDX` there is `[R14+0x50]-0x20`
+and `[RSP+0x20]` is zero. Do not return to the quest-marker chain,
+the HunterAbilityDeckManager chain, the AssetMemoryPool path, the
+NetMsgPlayerSpawn path, or the `GameModule+0x1C8` search.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
