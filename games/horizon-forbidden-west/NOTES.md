@@ -5077,6 +5077,113 @@ FUN_140986bc0(factory, &position, &out16)       ; allocates, then
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped. No probe.
 
+### The 16 bytes are MD5(parent UUID || slot) (2026-10-22)
+
+`FUN_140986bc0` writes them with one store. The 40 instructions
+before it do not compute the key. `RBP` is the third argument
+(`MOV RBP,R8` at `0x986BD7`) and `XMM0` is loaded from it:
+
+```
+RVA 0x986C3B VMOVUPS XMM0,xmmword ptr [RBP]
+RVA 0x986C40 MOV RAX,qword ptr [RDI]
+RVA 0x986C43 MOV RDX,RSI
+RVA 0x986C46 VMOVUPS xmmword ptr [RDI + 0x8],XMM0
+```
+
+In `FUN_140b22790` that pointer is `[RBP-0x39]`, the out buffer of
+`FUN_14011b2b0`. The parent UUID is not a register. It is the 16
+bytes already at `[RDI+0x8]`, and `RDI` is the incoming `RCX`
+(`MOV RDI,RCX` at `0xB227A4`):
+
+```
+RVA 0xB22949 LEA RDX,[RDI + 0x8]
+RVA 0xB2294D MOV R9D,0x4
+RVA 0xB22953 LEA R8,[RBP + 0x67]
+RVA 0xB22957 LEA RCX,[RBP + -0x39]
+RVA 0xB2295B CALL 0x14011b2b0
+```
+
+The 4-byte slot is the dword at `[RBP+0x67]`. The scan does not
+write it. The only store before the hash is zero:
+
+```
+RVA 0xB227CA XOR R15D,R15D
+RVA 0xB228FD MOV dword ptr [RBP + 0x67],R15D
+RVA 0xB22901 MOV R13D,R15D
+```
+
+`R13` is the loop counter. After a child is inserted, the function
+increments it and writes it back, then jumps to the scan:
+
+```
+RVA 0xB22BBB INC R13D
+RVA 0xB22BBE MOV EAX,R13D
+RVA 0xB22BC1 MOV dword ptr [RBP + 0x67],R13D
+RVA 0xB22BC5 CMP R13D,dword ptr [RBP + 0x6f]
+RVA 0xB22BC9 JL 0x140b22910
+```
+
+The scan walks the 0x40-stride array at `[component+0xD0]`, count
+`[component+0xC8]`, and compares a signed word at `[record+0x2]`
+with `R13+1`. A hit calls the hash. A miss leaves the zero dword
+alone. Neither path reads `[EntityManagerGame+0x1d8]`.
+
+`[RBP+0x6f]` is the bound. It is the signed word at the last
+record, 0x40 bytes before the end of that array:
+
+```
+RVA 0xB22836 MOVSXD RAX,dword ptr [RBX + 0xc8]
+RVA 0xB22848 MOV RAX,qword ptr [RBX + 0xd0]
+RVA 0xB2284F SHL RCX,0x6
+RVA 0xB22853 MOVSX EDX,word ptr [RCX + RAX*0x1 + -0x3e]
+RVA 0xB22858 MOV dword ptr [RBP + 0x6f],EDX
+```
+
+`FUN_14011b2b0` copies the parent UUID with one load
+(`VMOVUPS XMM0,xmmword ptr [RDX]` at `0x11B2C2`) and stores it at
+`[RBP+0x7]` (`0x11B2FE`). The length counter at `[RBP-0x1]` is set
+to `0x10` (`0x11B2F6`). `FUN_1400f44b0` then appends. Its first
+block is empty (`MOV EAX,dword ptr [RCX+0x18]` at `0xF44CA` is 0),
+so the 4 bytes are copied to `[ctx+0x20]`, which is 16 bytes after
+the UUID. Length becomes `0x14`. The input is 20 bytes, little
+endian, parent UUID then the slot dword. MD5 init is
+`0x67452301`, `0xEFCDAB89`, `0x98BADCFE`, `0x10325476`.
+
+The digest is stored little endian (`MOV EAX` of each state dword
+into `[RBP-0x29]` at `0x11B380` through `0x11B395`, then
+`VMOVUPS` to the out buffer at `0x11B39D`). Two patches:
+
+```
+RVA 0x11B3A1 MOVZX EAX,byte ptr [RBX + 0x6]
+RVA 0x11B3A5 AND byte ptr [RBX + 0x8],0x3f
+RVA 0x11B3A9 AND AL,0xf
+RVA 0x11B3AB OR AL,0x30
+RVA 0x11B3AD OR byte ptr [RBX + 0x8],0x80
+RVA 0x11B3B1 MOV byte ptr [RBX + 0x6],AL
+```
+
+Byte 6 of the digest is `(digest[6] & 0x0F) | 0x30`. Byte 8 is
+`(digest[8] & 0x3F) | 0x80`. The other 14 bytes are raw MD5.
+
+The recipe, not emitted. Read 16 bytes at `[[PlayerGame+0x30]+0x8]`
+(`PlayerManager*` at RVA `0x8982C80`). Pick a slot dword. The game
+uses `0` on the first pass and then `1, 2, ...` up to but not
+including the signed word at the last record of the component's
+0x40 array. Any dword whose 20-byte hash is not already a key in
+`[EntityManagerGame+0x1d8]` (`EntityManagerGame*` at RVA
+`0x8982C40`) is free; the same parent and the same slot hash to the
+same key. MD5 the 16 parent bytes followed by that dword, little
+endian, then patch byte 6 and byte 8 as above. Write the 16 bytes
+to `[entity+0x8]`. Then `FUN_140901310(RCX unused, RDX = entity,
+R8 = 1, R9 = 0, 5th = 0)`.
+
+`FUN_140986bc0` still allocates before the store, so it is not
+called on the entity we already have. `FUN_1402250c0`,
+`FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70` stay uncalled,
+`entity+0xD8` stays unwritten, `--add-player` stays alloc-only,
+`--link-puppet` stays as shipped, `--register-entity` stays
+unemitted. No probe.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
