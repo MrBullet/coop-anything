@@ -3323,6 +3323,112 @@ alloc-only and `--link-puppet` stays as shipped.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### Slot 0 of the object at `job+0x2f0` is `FUN_141406690`, and it does not insert the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0u.java` through `Slot2f0zl.java`;
+reports `local/slot2f0u.txt` through `local/slot2f0zl.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. The slot-0 function does not insert,
+so no call frame was emitted.
+
+The thunk window is not a vtable. `0xAAA4C0` is `JMP 0xA9F910`, the
+`MsgEntityAddedToScene` handler already named above. The object the
+handler calls is the element of the array, and that element is
+written by the wrapper constructors.
+
+`FUN_141405880` (1315 bytes) is the only caller of `FUN_141405ec0`.
+It does not grow an array at `+0x90`. That dword is a counter the
+function bumps after the call. The owner it passes is a pointer it
+loaded one loop earlier:
+
+```
+RVA 0x14059C0 MOV R15,qword ptr [R14]
+RVA 0x1405C3C MOV RDX,R15
+RVA 0x1405C42 CALL 0x141405ec0
+```
+
+`R14` is one entry of the pointer array `FUN_1413ffac0` filled.
+That function reads the global at RVA `0x8983278`, hashes the caller's
+key in the map at `+0x128`, and appends the value with `FUN_1400fe310`.
+`FUN_141405ec0` then does what the earlier note already quoted:
+
+```
+RVA 0x1405F0B MOV RCX,qword ptr [RDX]
+RVA 0x1405F11 ADD RCX,0x2e8
+RVA 0x1405F18 CALL 0x1400fe310
+```
+
+`[RDX]` is the first qword of that entry, and `FUN_140a9d520` is
+called on it at `0x14059DD` before the constructor runs. It walks
+`[obj+0x178]` and returns the first object whose type record matches
+RVA `0x2124270` (name `ScenePrefabInstance`) and whose parent matches
+RVA `0x2122100` (name `Scene`, size `0x410`). So the `RCX` of the
+append is a live `Scene`. The pointer it appends is the wrapper
+itself, vtable RVA `0x1990B10`, RTTI `.?AVQuestLocationMarkerWrapper@@`.
+
+The destructor confirms the same array. `FUN_141406490` frees the
+wrapper and then removes it:
+
+```
+RVA 0x1406521 MOV RCX,qword ptr [RBX + 0x10]
+RVA 0x1406525 MOV RCX,qword ptr [RCX]
+RVA 0x1406528 CALL 0x1413fa710
+```
+
+`FUN_1413fa710` (125 bytes) searches `data` at `+0x2f0` for the
+wrapper and shrinks the dword count at `+0x2e8`. That is the array
+`FUN_140a9f910` walks. The sibling
+`QuestSequenceEntityMarkerWrapper` (vtable `0x1990F20`) is removed
+the same way by `FUN_141408ac0`.
+
+A byte scan of every `ADD r64, 0x2e8` in executable memory found
+eight sites. Two are `ADD RSP`. The other four that are not the two
+wrapper constructors are `FUN_1404392d0` (a `ServerEventManager`
+destructor, calls `FUN_140100dd0`), `FUN_140709e50` (calls
+`FUN_1407178d0`, a chunked-list clear) and `FUN_14099bad0` (calls
+`FUN_14021b390`, then zeroes `+0x2f0`). None of them pushes a new
+element. No other writer of this array was found.
+
+Slot 0 of the wrapper is `FUN_141406690` (357 bytes). `RDX` is the
+entity. The function compares it and forwards it. It never stores it:
+
+```
+RVA 0x14066AB MOV RCX,qword ptr [RCX + 0x10]
+RVA 0x14066B2 CALL 0x140ab8dd0
+RVA 0x14066C3 MOV RCX,qword ptr [RBP + 0x280]
+RVA 0x14066CE MOV RCX,qword ptr [RBP + 0x278]
+RVA 0x1406797 CALL 0x140abc560
+RVA 0x14067A7 CALL 0x141406800
+```
+
+`FUN_140ab8dd0` returns a quest record. The two loads compare
+`entity+0x278` and `entity+0x280` against that record's identity.
+`FUN_140abc560` returns an entity already stored on the quest, and
+the call to `FUN_141406800` runs only when `RDX` is that entity.
+`FUN_141406800` (264 bytes) allocates `0xA0` bytes and copies two
+qwords from the entity (`+0x8` and `+0x10`) into it. The only
+pointer store of that block is into the quest, through
+`FUN_141407df0`. Nothing writes `child+0x80`, `parent+0x88`, a model
+slot, or a counted world list. The four globals we hold are not
+loaded. `FUN_1414091b0` (64 bytes), slot 0 of the sequence wrapper,
+forwards the same way and does not store `RDX` either.
+
+Miss. The virtual call notifies a quest marker that an entity it
+already tracks was added to a `Scene`. It does not insert that
+entity into `EntityManagerGame`, `GameModule`, `SceneManagerGame` or
+`PlayerManager`.
+
+The single next decompile is `FUN_141407df0` (called at `0x14068C2`
+with `RCX` = the quest and `RDX` = the `0xA0`-byte block). The
+question is whether that function, which is the only one here that
+receives both a live quest object and a pointer derived from the
+entity, writes the entity into a manager we already hold.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
