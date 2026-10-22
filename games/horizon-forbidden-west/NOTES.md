@@ -3577,6 +3577,131 @@ whether the only world-facing store is the camera-list push.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140d73270` stores the entity only at `[PlayerGame+0x30]` (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0zzb.java`, `Slot2f0zzc.java`,
+`Slot2f0zzd.java`, `Slot2f0zzf.java`, `Slot2f0zzg.java`,
+`Slot2f0zzh.java`, `Slot2f0zzi.java`, `Slot2f0zzj.java`; reports
+`local/slot2f0zzb.txt` through `local/slot2f0zzj.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. No store writes the entity into a
+manager, so no call frame was emitted.
+
+`FUN_140d73270` is 416 bytes. The entry saves `RCX` and calls with
+`RDX` still the incoming argument; `R8` is not an argument and is
+never read:
+
+```
+RVA 0xD73270 MOV qword ptr [RSP + 0x10],RBX
+RVA 0xD73282 MOV RSI,RCX
+RVA 0xD73285 CALL 0x140913be0
+```
+
+The object loaded at `0xD733C2` is a `CameraPredictionManager*`. The
+load is `48 8B 3D E7 F8 C0 07`, and
+`0xD733C2 + 7 + 0x07C0F8E7 = 0x8982CB0`. The publisher of that slot,
+`FUN_140d5e2c0` at `0xD5FA19`, stores the block it just constructed
+with `FUN_1409581c0`, and that constructor writes
+`LEA RAX,[0x1418AC588]` at `0x9581CC`. The Complete Object Locator
+before that vtable is VA `0x141A259B8`, whose type descriptor is
+`.?AVCameraPredictionManager@@`.
+
+The entity pointer is saved once, inside the callee. `FUN_140913be0`
+(280 bytes) does `MOV RBX,RDX` at `0x913C0D` and the only store of
+that register is:
+
+```
+RVA 0x913CB7 MOV qword ptr [RDI + 0x30],RBX
+```
+
+`RDI` is `RCX` of `FUN_140913be0`, which is the `PlayerGame` being
+built, so this is `[PlayerGame+0x30] = entity`. `RBX` is reloaded
+from the stack at `0x913CE5` and the entity is not in a register
+again. Nothing else in `FUN_140d73270` or in `FUN_140913be0` stores
+it. The other stores write vtables (`PlayerGame::vftable` at
+`[RSI]`, `[RSI+0x20]`, `[RSI+0x128]` and `[RSI+0x130]`, RVAs
+`0x18FBD80`, `0x18FB308`, `0x18FBF48`, `0x18FBEF0`) or zeroes. None
+is a parent pointer, a model slot, or a counted list.
+
+The one list this function does push is not the entity. After the
+lock on `[CameraPredictionManager+0x20]`:
+
+```
+RVA 0xD733C2 MOV RDI,qword ptr [0x148982cb0]
+RVA 0xD733D9 TEST RSI,RSI
+RVA 0xD733DC LEA RCX,[RDI + 0x30]
+RVA 0xD733E0 CMOVZ R14,RBP
+RVA 0xD733E4 MOV RDX,R14
+RVA 0xD733E7 CALL 0x1400fe310
+```
+
+`R14` was set at `0xD7329A` with `LEA R14,[RSI+0x130]`, and `RBP` is
+0, so `RDX` is `PlayerGame+0x130` (null only if `this` is null).
+`FUN_1400fe310` writes that pointer at `[RCX + count*8]`
+(`MOV qword ptr [RCX + RBP*0x8],R14` at `0xFE385`). The element is
+the `PlayerGame` subobject, not the entity.
+
+Callers, five references, four of them code:
+
+| from | what RDX is |
+|---|---|
+| `0x134CA90` | `FUN_14134c950`, `MOV RDX,R15` at `0x134CA87`. `R15` is `[[GameModule+0x50]+0x20]`, the live entity. |
+| `0x134CAA8` | the same function, null-`this` arm, `MOV RDX,R15` at `0x134CAA0`. |
+| `0x13D8540` | `FUN_1413d8470`, `MOV RDX,RSI` at `0x13D853A`. `RSI` is the same `[[GameModule+0x50]+0x20]`. |
+| `0xD724ED` | thunk at `0xD724E0`: `MOV RAX,RDX` / `XOR EDX,EDX` / `MOV RCX,RAX` / `JMP FUN_140d73270`. It constructs whatever pointer it was given, and it zeroes the entity argument. |
+
+`FUN_14134c950` and `FUN_1413d8470` are the two that hold both the
+entity we can name and `GameModule*`, and both are already blocked.
+The thunk passes no entity at all. None of the four passes the
+entity together with `EntityManagerGame*`, `SceneManagerGame*` or
+`PlayerManager*`.
+
+The `PlayerGame` vtable at `0x18FBD80` has five slots that load one
+of the four manager globals, and none of them is a new insert of the
+entity:
+
+| slot | function | what it loads | what it does with an entity |
+|---|---|---|---|
+| `+0x28` | `FUN_140d73c90` (3939 bytes) | `GameModule*` at `0xD748B1` | reads `[PlayerGame+0x30]` only by handing the `PlayerGame` to `FUN_140d72230` |
+| `+0x78` | `FUN_140d77660` (57 bytes) | `GameModule*` at `0xD77660` | writes `[GameModule+0x4bc]`, no entity |
+| `+0xE8` | `FUN_140d8c2d0` (554 bytes) | `GameModule*` at `0xD8C3AF` | `RDX` is a `PlayerGame`, already excluded |
+| `+0xF0` | `FUN_140d8c500` (282 bytes) | `GameModule*` at `0xD8C512` | the matching remove, `RDX` a `PlayerGame` |
+| `+0x138` | `FUN_14111f3c0` (26 bytes) | `EntityManagerGame*` at `0x111F3C0` | reads `[EntityManagerGame+0xA0]`, no entity argument |
+
+`FUN_140d73c90` is the only one of those that both loads a manager
+and reaches the entity. Its entry saves `RDX` to `RSI`
+(`MOV RSI,RDX` at `0xD73CB2`) and `RCX` to `R13`, and the later
+`[R15+0x30]` at `0xD74AB1` is not the entity: `R15` was loaded from
+`[RAX+0x80]` at `0xD74A84`. The entity path is the call at the
+bottom of the `GameModule` load:
+
+```
+RVA 0xD748B1 MOV RAX,qword ptr [0x148983150]
+RVA 0xD748C8 MOV R10,qword ptr [RAX + 0x50]
+RVA 0xD748F2 MOV qword ptr [RSP + 0x28],R10
+RVA 0xD74900 MOV RCX,R13
+RVA 0xD7490E CALL 0x140d72230
+```
+
+`FUN_140d72230` (458 bytes) takes the `PlayerGame` in `RCX` and
+`[GameModule+0x50]` as a stack argument. It loads neither of the
+four manager globals itself, and its one `+0x30` is
+`MOV RBP,qword ptr [R11+0x30]` at `0xD723E9` on a pointer of its
+own. So the slot reaches the entity only through the `PlayerGame`
+it was called on.
+
+The single next decompile is `FUN_140d73c90` (`0xD73C90`, 3939
+bytes, `PlayerGame::vftable+0x28`). The question is what `RDX` is at
+`0xD73CB2`, and whether the call at `0xD7490E` writes
+`[PlayerGame+0x30]` into `EntityManagerGame`, `SceneManagerGame` or
+`PlayerManager`, or only reads it. No call until that register and
+that store are named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
