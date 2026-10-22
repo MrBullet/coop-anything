@@ -3819,6 +3819,95 @@ The question is whether any of those three stores the entity, or
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_1410ce420` never holds the entity (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0zzw.java`; report
+`local/slot2f0zzw.txt`). No re-analysis, no symbol scan, no inject,
+no launch, nothing written under `M:\`. No new probe mode. No store
+writes the entity into a manager, so no call frame was emitted.
+
+`FUN_1410ce420` is 918 bytes. `RCX` is the
+`HunterAbilityDeckManager` built at `0xD73BE5`. It is saved to `R12`
+at entry and stays there:
+
+```
+RVA 0x10CE434 MOV R12,RCX
+RVA 0x10CE437 MOV RBX,RDX
+```
+
+The entity is not an argument and is not loaded. `RDX` is the object
+from `[0x1489581D0]`, and the first thing done with it is a walk of
+its own array, `[RDX+0x30]` at `0x10CE458`. The read named in the
+question is the deck's field:
+
+```
+RVA 0x10CE5C4 MOV RAX,qword ptr [R12 + 0x30]
+```
+
+`R12` is the deck, and `[deck+0x30]` is `[entity+0x48]` as stored at
+`0xD73BF8`. The next two instructions index that object
+(`MOV R14, [RAX+0x60]` at `0x10CE5C9`, `MOVSXD R15, [RAX+0x58]` at
+`0x10CE5CD`). `RAX` is then overwritten. Nothing in the function
+stores `R12`, `RAX` from that load, or any pointer back to the
+`0x300` entity. The qword stores write fields of a block this
+function allocates (`[RAX+0x20] = R12` at `0x10CE526` and again at
+`0x10CE6CE`), which is the deck, not the entity.
+
+Neither callee named in the question was opened. Both were checked
+for a reference to a manager global and neither has one:
+`FUN_1410cd880` (465 bytes, call at `0x10CE5AB`) and `FUN_1410cdbb0`
+(291 bytes, call at `0x10CE77D`). The other eight calls
+(`FUN_140407da0`, `FUN_1401e6100` twice, `FUN_1410de3b0` twice,
+`FUN_1402084c0` twice, `FUN_140348c40`) also reference none of
+`EntityManagerGame*` (`0x8982C40`), `SceneManagerGame*`
+(`0x8982DD0`), `PlayerManager*` (`0x8982C80`) or `GameModule*`
+(`0x8983150`). At `0x10CE5AB` the argument is a node of the array
+walked from `RDX`. At `0x10CE77D` `RCX` is that same node
+(`MOV RBP, [RDX+RCX+0x10]` at `0x10CE73D`) and `RDX` is
+`[RBX]`, an element of a second array.
+
+Miss. This chain reads `[entity+0x48]` and writes the deck's own
+fields. It does not write the entity into `EntityManagerGame`,
+`SceneManagerGame`, `PlayerManager`, or a counted world list.
+
+`FUN_140d73960` is the only function that loads
+`[PlayerGame+0x30]`. It has two calls. `0xD73D71` is inside
+`FUN_140d73c90`, already walked. The other is `0xD737C1` in
+`FUN_140d737a0` (353 bytes), which is `PlayerGame::vftable+0x20`
+(the pointer at `0x18FBDA0`). It saves `RCX` to `R15` and reads the
+entity itself:
+
+```
+RVA 0xD737B6 MOV R15,RCX
+RVA 0xD737C6 MOV R14,qword ptr [R15 + 0x30]
+```
+
+`R14` is live at the return and is passed to no call. The function
+loads none of the three manager globals. Its first call,
+`FUN_140914010` at `0xD737B9`, loads `RepresentationManagerGame*`
+(`0x8982DA0`, published by `MOV [0x148982DA0], RAX` at `0xD5EAC4`,
+type `.?AVRepresentationManagerGame@@`) and then reads
+`[[PlayerGame+0x30]+0x40]` at `0x914177`. That is a field of the
+entity, and the pointer stored afterwards is the block it just
+allocated (`MOV [RBX+0x50], R10` at `0x9141E0`). The virtual it
+calls, `FUN_14142bed0` (`RepresentationManagerGame::vftable+0xC0`),
+reads `[[PlayerGame+0x30]+0x30]` at `0x142BEF2` and passes that, not
+the entity, to `FUN_141422500`. No function that references
+`PlayerManager*` then reads `[[PlayerManager+0x10][i]+0x30]` (271
+functions, no hit).
+
+The single next decompile is `FUN_140d737a0` (`0xD737A0`, 353
+bytes, `PlayerGame::vftable+0x20`). The question is what `R14`
+(`[PlayerGame+0x30]`) is used for after `0xD737C6`, and whether any
+callee it reaches with that pointer stores the entity into
+`EntityManagerGame`, `SceneManagerGame` or `PlayerManager`. No call
+until that use is named.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
