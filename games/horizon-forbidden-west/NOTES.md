@@ -3502,6 +3502,81 @@ or the `0xA0` block, into one of the four managers we hold.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_1413efb50` initialises a quest marker, not a manager (2026-10-22)
+
+Offline only. `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/Slot2f0zw.java`, `Slot2f0zx.java`,
+`Slot2f0zy.java`, `Slot2f0zz.java`, `Slot2f0zza.java`; reports
+`local/slot2f0zw.txt` through `local/slot2f0zza.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. No new probe mode. The function does not insert the
+entity, so no call frame was emitted.
+
+The call at `0x1407EBA` is inside `FUN_141407df0` (431 bytes), and
+it takes one argument. `RCX` is the `0x450` node just allocated;
+`RDX` and `R8` are not set for this call:
+
+```
+RVA 0x1407E79 MOV RSI,RAX
+RVA 0x1407E8B MOV qword ptr [RSI + 0x8],RDI
+RVA 0x1407E97 MOV RCX,RSI
+RVA 0x1407E9A MOV qword ptr [RSI + 0x10],RBP
+RVA 0x1407E9E MOV qword ptr [RSI + 0x18],RAX
+RVA 0x1407EBA CALL 0x1413efb50
+```
+
+`RDI` is the `0xA0` block (`MOV RDI,RDX` at `0x1407E1B`), stored at
+`node+0x8` before the call. `RBP` is the quest. `RAX` at `0x1407E9E`
+is `[quest+0x30]`, stored at `node+0x18`. The entity pointer is not
+in any of those registers.
+
+`FUN_1413efb50` is 580 bytes. It reads `node+0x10` (the quest) and
+looks that quest up in the map at `0x148983278` (`0x13EFB94`,
+`0x13EFCD2`). When the marker is not yet enabled it writes
+`QuestMarkerInstance::EnabledState::vftable` (`LEA RAX,[0x14198d168]`
+at `0x13EFC37`) onto the node itself and calls `FUN_14137aee0` at
+`0x13EFD51`. That call's `RDX` is `[node+0x8]`, the `0xA0` block
+(`MOV RDX,qword ptr [RDI+0x8]` at `0x13EFD21`), and its `RCX` is
+`node+0x3f0`. `FUN_14137aee0` (946 bytes) loads none of the four
+manager globals. Nothing in `FUN_1413efb50` writes `child+0x80`,
+`parent+0x88`, a model slot, or a counted list, and it never loads
+`EntityManagerGame*` (`0x8982C40`), `GameModule*` (`0x8983150`),
+`SceneManagerGame*` (`0x8982DD0`) or `PlayerManager*` (`0x8982C80`).
+
+The one later function that does load a manager is not this call.
+`FUN_1413efe60` (3218 bytes), reached from the already-enabled arm
+at `0x13EFD65`, loads `GameModule*` at `0x13F0749` and pushes onto
+`[[GameModule+0x558]+0x40]`. The element is a `0x240`-byte
+`CustomMarker` it allocates itself (`MOV EDX,0x240` at `0x13F07EF`,
+`CustomMarkerManager::CustomMarker::vftable` at `0x13F0812`), and
+what it stores at that object's `+0x1e0` is `node+0x10`
+(`LEA R15,[RSI+0x10]` at `0x13F0750`, `MOV [RDI+0x1e0],R15` at
+`0x13F086C`). The push is `FUN_1402250c0` at `0x13F08A0` with
+`RCX = [[GameModule+0x558]+0x40]` and `RDX = &local`, and the local
+holds the new `CustomMarker*`. Neither the entity nor the `0xA0`
+block is the element. `FUN_1413efe60` also reads `[node+0x3c8]` at
+entry and returns immediately when that dword is 0, which is the
+value `FUN_141407df0` stored at `0x1407EB0`.
+
+Miss. `FUN_1413efb50` only fills fields of the quest's own `0x450`
+node. The quest-marker chain (wrapper, slot 0, the `0xA0` copy, the
+`quest+0x78` node, and now this initialiser) does not register an
+entity. Its callers that also load `GameModule*` (`FUN_14140dd20`,
+`FUN_141407660`, `FUN_14140a460`) pass the same node, not the entity.
+
+The single next decompile is `FUN_140d73270` (`0xD73270`, 416
+bytes). It is the constructor that takes the entity in `RDX` and
+publishes a `PlayerGame` into the camera manager we already hold
+(`MOV RDI,[0x148982CB0]` at `0xD733C2`, then `FUN_1400fe310` at
+`0xD733E7`). The question is which of its stores, other than
+`[PlayerGame+0x30] = entity` at `0x913CB7`, writes that entity into
+`EntityManagerGame`, `SceneManagerGame` or `PlayerManager`, or
+whether the only world-facing store is the camera-list push.
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
