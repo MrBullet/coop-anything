@@ -4700,6 +4700,145 @@ NetMsgPlayerSpawn path, or the `GameModule+0x1C8` search.
 stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
 alloc-only and `--link-puppet` stays as shipped.
 
+### `FUN_140901310` inserts the entity; the stored pointer is the entity (2026-10-22)
+
+`FUN_140901310` is 1322 bytes. `RDX` is the `0x300` `ControlledEntity`.
+The pointer stored at `[record+0x10]` is that entity, not a field of
+it. No probe.
+
+The previous note's stack arithmetic was wrong. The prologue saves
+four registers before five pushes, so the saved `RDX` is not
+`[RBP+0x67]`:
+
+```
+RVA 0x901310 MOV qword ptr [RSP + 0x8],RBX
+RVA 0x901315 MOV qword ptr [RSP + 0x18],RSI
+RVA 0x90131A MOV qword ptr [RSP + 0x20],RDI
+RVA 0x90131F MOV qword ptr [RSP + 0x10],RDX
+RVA 0x901324 PUSH RBP
+RVA 0x901325 PUSH R12
+RVA 0x901327 PUSH R13
+RVA 0x901329 PUSH R14
+RVA 0x90132B PUSH R15
+RVA 0x90132D LEA RBP,[RSP + -0x2f]
+RVA 0x901332 SUB RSP,0xc0
+RVA 0x901339 MOV R15,qword ptr [0x148982c40]
+RVA 0x901346 MOV RSI,RDX
+RVA 0x901349 OR.LOCK dword ptr [RDX + 0x98],0x10000000
+```
+
+The bytes at `0x90132D` are `48 8D 6C 24 D1`. After the five pushes
+the incoming `[RSP+0x10]` (the saved `RDX`) sits at `[RSP+0x38]`,
+which is `[RBP+0x67]`. `[RBP+0x7f]` is the fifth argument, the
+incoming `[RSP+0x28]`. `R15` is `EntityManagerGame*` from the global
+at RVA `0x8982C40`. `RSI` is `RDX` and is never replaced.
+
+`+0xD8` is copied from the entity into the entity. `RAX` is reloaded
+from the same saved slot, so it is still `RDX`:
+
+```
+RVA 0x901354 MOV RAX,qword ptr [RBP + 0x67]
+RVA 0x901358 VMOVUPS XMM0,xmmword ptr [RAX + 0xd8]
+RVA 0x901360 VMOVUPS xmmword ptr [RAX + 0x118],XMM0
+RVA 0x901368 VMOVSD XMM1,qword ptr [RAX + 0xe8]
+RVA 0x901370 LEA RCX,[RAX + 0xf0]
+RVA 0x901377 LEA RDX,[RAX + 0x130]
+RVA 0x90137E VMOVSD qword ptr [RAX + 0x128],XMM1
+RVA 0x90138B VMOVUPS YMM0,ymmword ptr [RCX]
+RVA 0x90138F VMOVUPS ymmword ptr [RDX],YMM0
+RVA 0x901393 MOV EAX,dword ptr [RCX + 0x20]
+RVA 0x901396 MOV dword ptr [RDX + 0x20],EAX
+```
+
+That is `[entity+0xD8]` and `[entity+0xE0]` into `[entity+0x118]`,
+`[entity+0xE8]` into `[entity+0x128]`, and the 0x24 bytes at
+`[entity+0xF0]` into `[entity+0x130]`. It is a copy of the entity's
+own position, not a pointer. The constructor zeroes those three
+qwords, so a fresh entity already has them, and the copy does not
+require `+0xD8` to be non-null. The function does not test it.
+
+The hash key is the entity's own UUID, and the listener post uses the
+entity's own lock:
+
+```
+RVA 0x9013BE MOV RCX,qword ptr [RBX + 0xc8]
+RVA 0x9014C9 MOV RDX,qword ptr [RBX + 0x70]
+RVA 0x901517 LEA RCX,[RBX + 0x2c0]
+RVA 0x901521 LEA RDX,[RBX + 0x298]
+RVA 0x90152C CALL 0x14097fbe0
+RVA 0x90154E LEA R9,[RBX + 0x8]
+```
+
+`+0x298` and `+0x2c0` are the lock and the listener list already named
+on a live entity. `[entity+0xC8]` is the post target of
+`MsgEntityTeleported`; the call at `0x9013EE` is skipped when it is
+null. `[entity+0x70]` is tested the same way before `FUN_14097faf0`.
+Neither has to be non-null for the insert.
+
+The call at `0x901583`. `RBX` is the entity. `R14` is zero. The fifth
+argument is the address of the saved `RDX` slot, whose qword is the
+entity:
+
+```
+RVA 0x90154E LEA R9,[RBX + 0x8]
+RVA 0x901552 MOV byte ptr [RSP + 0x30],R14B
+RVA 0x901557 LEA RAX,[RBP + 0x67]
+RVA 0x90155B MOV byte ptr [RSP + 0x28],R14B
+RVA 0x901560 MOV R8,R14
+RVA 0x901563 MOV qword ptr [RSP + 0x20],RAX
+RVA 0x901568 CRC32 R8,qword ptr [R9]
+RVA 0x901571 LEA RCX,[R15 + 0x1d8]
+RVA 0x901578 CRC32 R8,qword ptr [R9 + 0x8]
+RVA 0x90157F LEA RDX,[RBP + -0x39]
+RVA 0x901583 CALL 0x140911320
+```
+
+| register | of `FUN_140901310` | of `FUN_140911320` |
+|---|---|---|
+| `RCX` | unused | `&[EntityManagerGame+0x1d8]` |
+| `RDX` | the entity | `&local`, the out iterator |
+| `R8` | a mode dword | the CRC32 of `[entity+0x8]` and `[entity+0x10]` |
+| `R9` | a second mode dword | `&[entity+0x8]`, the 16-byte key |
+| `[RSP+0x20]` | a fifth pointer, unused by the insert | `&saved_RDX`, and `[saved_RDX]` is the entity |
+| `[RSP+0x28]` | | 0 |
+| `[RSP+0x30]` | | 0 |
+
+Inside `FUN_140911320` the store is a dereference, not the address of
+the slot. The bytes at `0x9114DD` are `48 8B 44 24 60`:
+
+```
+RVA 0x9114D8 VMOVUPS XMM0,xmmword ptr [RBP]
+RVA 0x9114DD MOV RAX,qword ptr [RSP + 0x60]
+RVA 0x9114E2 VMOVUPS xmmword ptr [RBX],XMM0
+RVA 0x9114ED MOV RCX,qword ptr [RAX]
+RVA 0x9114F0 MOV qword ptr [RBX + 0x10],RCX
+RVA 0x9114F4 MOV dword ptr [RBX + 0x18],ESI
+```
+
+`[RSP+0x60]` is the caller's `[RSP+0x20]`, so `RAX` is `&saved_RDX`
+and `RCX` is the entity. `[record+0]` and `[record+0x8]` are
+`[entity+0x8]` and `[entity+0x10]`. `[record+0x18]` is the hash.
+`[record+0x10]` is the entity itself.
+
+The insert is fillable from the global at RVA `0x8982C40` and an
+entity we allocate. It is not emitted. The frame is
+`FUN_140901310(RCX unused, RDX = entity, R8 = 1, R9 = 0, [RSP+0x20] = 0)`.
+`R8 = 1` is the path every caller that has just constructed an entity
+takes (`LEA R8D,[R9+0x1]` at `0xB22A45`, `0xB28919`, `0xB88156`,
+`0xE8DF64`, `0xE8E29A`, `0x1325246`), and that value skips the
+`[entity+0x68]` read at `0x901426`. `R9 = 0` skips the virtual call at
+`0x901416`. `[entity+0xD8]` is copied and does not have to be
+non-null. `[entity+0xC8]` and `[entity+0x70]` are tested and skipped
+when null. What the call does use is `[entity+0x8]` and `[entity+0x10]`
+as the UUID key, `[entity+0x98]` for the two locked bit sets, and
+`[entity+0x298]` plus `[entity+0x2c0]` for the
+`MsgAddedToEntityManager` post. A duplicate UUID hits the fatal path
+at `0x901596` (`0xdeadca7` at `0x901647`).
+
+`FUN_1402250c0`, `FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70`
+stay uncalled, `entity+0xD8` stays unwritten, `--add-player` stays
+alloc-only and `--link-puppet` stays as shipped.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
