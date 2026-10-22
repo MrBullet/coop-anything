@@ -5465,6 +5465,144 @@ The single next fix: follow the taken branch at `0x901652` and name
 the listener virtual call at `0x9017E9`, which is the first
 `CALL [RAX]` the fresh insert actually reaches.
 
+### `0x9017E9` is `SpawnedEntityMapping` slot 0, and the hash record is already linked (2026-10-22)
+
+`CALL qword ptr [RAX]` at `0x9017E9` is slot 0 of a
+`SpawnedEntityMapping` listener. `RCX` is one element of the pointer
+vector at `[EntityManagerGame+0x1f18]` (count at `+0x1f10`, lock at
+`+0x1f08`). `RDX` is the entity. The call dereferences the listener,
+not the entity: `MOV RAX, [RCX]` then `CALL [RAX]`.
+
+The fresh-insert branch from `0x901652` to the return, every `CALL`:
+
+```
+RVA 0x90165A CALL qword ptr [0x14174b1c0]   ; unlock, only if R12 != 0
+RVA 0x90167C CALL 0x14094c8b0               ; entity, skipped if bit 23 of [entity+0x98] is set
+RVA 0x9016FE CALL 0x140132d10               ; doubles, not the entity
+RVA 0x901755 CALL qword ptr [0x14174b2f8]
+RVA 0x901762 CALL qword ptr [0x14174b1c8]
+RVA 0x90176B CALL qword ptr [0x14174b2f8]
+RVA 0x901778 CALL qword ptr [0x14174b1c8]
+RVA 0x901788 CALL 0x14090aba0               ; RDX = entity+0x38, a pointer the ctor wrote
+RVA 0x901795 CALL qword ptr [0x14174b1c0]
+RVA 0x9017A3 CALL qword ptr [0x14174b1c0]
+RVA 0x9017B3 CALL qword ptr [0x14174b300]
+RVA 0x9017C0 CALL qword ptr [0x14174b1d8]
+RVA 0x9017E9 CALL qword ptr [RAX]           ; listener slot 0
+RVA 0x9017FC CALL qword ptr [0x14174b1d0]
+RVA 0x901814 CALL qword ptr [RAX + 0x48]    ; [0x148982FE8] slot +0x48, skipped when that global is 0
+```
+
+The twenty instructions in front of the call name both registers:
+
+```
+RVA 0x9017A9 LEA R14,[R15 + 0x1f08]
+RVA 0x9017B0 MOV RCX,R14
+RVA 0x9017B3 CALL qword ptr [0x14174b300]
+RVA 0x9017B9 TEST AL,AL
+RVA 0x9017BB JNZ 0x1409017c6
+RVA 0x9017BD MOV RCX,R14
+RVA 0x9017C0 CALL qword ptr [0x14174b1d8]
+RVA 0x9017C6 MOV RBX,qword ptr [R15 + 0x1f18]
+RVA 0x9017CD MOVSXD RAX,dword ptr [R15 + 0x1f10]
+RVA 0x9017D4 LEA RSI,[RBX + RAX*0x8]
+RVA 0x9017D8 CMP RBX,RSI
+RVA 0x9017DB JZ 0x1409017f4
+RVA 0x9017E0 MOV RCX,qword ptr [RBX]
+RVA 0x9017E3 MOV RDX,RDI
+RVA 0x9017E6 MOV RAX,qword ptr [RCX]
+RVA 0x9017E9 CALL qword ptr [RAX]
+```
+
+`R15` is `EntityManagerGame*` (the load at `0x901339`). `RDI` is the
+entity (`MOV RDI, [RBP+0x67]` at `0x90166E`, the saved `RDX`). `RBX`
+walks the vector. `RCX` is the listener. `RAX` is `[listener+0]`, and
+the call is slot 0 (`CALL [RAX]`, displacement 0). An empty vector
+jumps over it (`CMP RBX, RSI` / `JZ 0x1409017f4`).
+
+The one object this vector is filled with, in `FUN_140d5e2c0`, is
+built at `0xD5F0D9` (`MOV EDX, 0xC8`) and pushed by `FUN_1400fe310`
+at `0xD5F156` (`LEA RCX, [EntityManagerGame+0x1f10]` /
+`MOV [data + index*8], RDX` at `0xFE385`). The template it would
+clone, `[[0x148983128]+0x220]`, is zero: `FUN_140d49bd0` writes
+`MOV [RCX+0x220], RDX` at `0xD49D8E` and `RDX` is the same zero it
+stores from `+0x88` through `+0x218`. The `JNZ 0x140d5f0a0` at
+`0xD5F000` is therefore not taken, and the object that is pushed is
+the fallback:
+
+```
+RVA 0xD5F066 MOV qword ptr [RBX + 0x8],R15
+RVA 0xD5F06A LEA RAX,[0x1418c8748]
+RVA 0xD5F071 MOV qword ptr [RBX],RAX
+```
+
+`R15` is zero (`XOR` earlier in that constructor). The Complete
+Object Locator at `0x1418C8748 - 8` (`0x141A4A900`, type descriptor
+RVA `0x2271778`) names `.?AVSpawnedEntityMapping@@`. Slot 0 of that
+vtable is `FUN_140abe130` (313 bytes). Slot `+0x8` is
+`FUN_140abe270`, which is the matching call on the unparent path
+(`CALL [RAX+0x8]` at `0x9026F9`), not this one.
+
+`FUN_140abe130` takes the listener in `RCX` and the entity in `RDX`.
+Its first act is the component map:
+
+```
+RVA 0xABE142 LEA RCX,[RDX + 0xa0]
+RVA 0xABE149 LEA RDX,[0x142124320]
+RVA 0xABE150 CALL 0x1408fa230
+RVA 0xABE155 TEST RAX,RAX
+RVA 0xABE158 JZ 0x140abe261
+```
+
+`0x142124320` is the `SpawnSetupComponent` type record (name at
+`+0x40`, RVA `0x1E84750`). `FUN_1408fa230` loads the map with no null
+test:
+
+```
+RVA 0x8FA235 MOV R9,qword ptr [RCX + 0x18]
+RVA 0x8FA23C MOVSXD R8,dword ptr [RCX + 0x10]
+```
+
+`RCX` is `entity+0xa0`, so that first load is `[entity+0xb8]`, and
+the count is `[entity+0xb0]`. `FUN_140948a10` writes both, and
+`FUN_1411a0980` does not touch them:
+
+```
+RVA 0x948A2A XOR EBP,EBP
+RVA 0x948A91 MOV qword ptr [RCX + 0xb0],RBP
+RVA 0x948A98 MOV qword ptr [RCX + 0xb8],RBP
+```
+
+A zero count makes `TEST R8D, R8D` / `JLE 0x1408fa28a` skip the walk,
+then `CMP R9, RBX` / `JZ 0x1408fa2b4` returns `XOR EAX, EAX`. The
+`JZ 0x140abe261` that follows is the function's `RET`. So a
+constructor-fresh entity does not fault inside this slot: the map is
+present and empty, and the lookup returns before it reads a
+component. The later uses in the same function (`[RAX+0x58]` at
+`0xABE17F`, then `FUN_1401ecd50` at `0xABE22F` with
+`R9 = &entity+0x8`) are behind that null test.
+
+The hash record is already linked before `0x9017E9`. The empty-slot
+store `MOV [RBX+0x10], RCX` at `0x9114F0` and `INC [R15+0x8]` at
+`0x9114F7` both ran: occupied went `2229 -> 2230` and the bucket
+count stayed `4096`. `[record+0x10]` is the entity. Nothing between
+that store and `0x9017E9` writes the record again. The call is the
+listener notify, and it does not have to succeed for the record to
+exist.
+
+Offline only. Sixteen `-noanalysis -readOnly -process` passes
+(`local/ghidra_scripts/RegFault12.java` through `RegFault27.java`,
+reports `local/regfault12.txt` through `local/regfault27.txt`). No
+re-analysis, no symbol scan, no inject, no launch, nothing written
+under `M:\`. The probe was not changed. `FUN_1402250c0`,
+`FUN_14134c950`, `FUN_1413d8470` and `FUN_14101bd70` stay uncalled.
+
+The single next fix: the hash record is already linked, so skip
+`FUN_140901310` for an entity this probe inserted and call
+`SpawnedEntityMapping` slot 0 (`FUN_140abe130`, `RCX` = the listener
+at `[EntityManagerGame+0x1f18]`, `RDX` = the entity) on its own,
+which is the notify `0x9017E9` still has to finish.
+
 ## Sources
 
 - https://github.com/JustAddMP/HorizonForbiddenWest (2026-10-17, README only)
